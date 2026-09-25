@@ -239,6 +239,12 @@ let
         }
       ];
     };
+    networking.firewall.allowedTCPPorts = [ 80 ];
+    services.nginx = {
+      enable = true;
+      virtualHosts.health.locations."/health".return = "200 healthy";
+      virtualHosts.health.locations."/health-json".extraConfig = "default_type application/json; return 200 '{ \"status\": \"ready\" }';";
+    };
   };
 in
 pkgs.testers.runNixOSTest {
@@ -314,6 +320,26 @@ pkgs.testers.runNixOSTest {
     controller.succeed("ssh app-standby test -f /etc/cattix-deployed")
     controller.succeed("ssh app-primary test -f /etc/cattix-deployed")
 
+    previous_primary = controller.succeed("ssh app-primary readlink /run/current-system").strip()
+    controller.succeed("ssh app-primary 'mkdir /run/cattix-deployment.lock && printf held-by-test > /run/cattix-deployment.lock/owner'")
+    locked = controller.fail(
+        "cattix --flake /tmp/cattix-test --impure --json rollback --host app-primary"
+    )
+    assert "cattix deployment lock is held by held-by-test" in locked
+    controller.succeed("ssh app-primary 'rm /run/cattix-deployment.lock/owner && rmdir /run/cattix-deployment.lock'")
+
+    manual_rollback = controller.succeed(
+        "cattix --flake /tmp/cattix-test --impure --json rollback --host app-primary"
+    )
+    manual_events = [json.loads(line) for line in manual_rollback.splitlines()]
+    assert any(event["step"] == "verifying-rollback" and event["status"] == "done" for event in manual_events)
+    assert controller.succeed("ssh app-primary readlink /run/current-system").strip() != previous_primary
+
+    controller.succeed(
+        "cattix --flake /tmp/cattix-test --impure --json deploy --host app-primary"
+    )
+    assert controller.succeed("ssh app-primary readlink /run/current-system").strip() == previous_primary
+
     skipped = controller.succeed(
         "cattix --flake /tmp/cattix-test --impure --json deploy --group app"
     )
@@ -332,6 +358,7 @@ pkgs.testers.runNixOSTest {
     failed_events = [json.loads(line) for line in failed.splitlines()]
     assert any(event["step"] == "checking" and event["status"] == "failed" for event in failed_events)
     assert any(event["step"] == "rolling-back" and event["status"] == "done" for event in failed_events)
+    assert any(event["step"] == "verifying-rollback" and event["status"] == "failed" for event in failed_events)
     controller.succeed("ssh app-primary test -f /etc/cattix-deployed")
     controller.fail("ssh app-primary test -f /etc/cattix-failed")
     app_standby.crash()

@@ -2,7 +2,7 @@
 
 Fleet management for NixOS hosts: inventory, drift detection, updates, vulnerability scanning and health-gated rolling deployments, driven from a Nix flake.
 
-> Status: the Rust CLI foundation, read-only commands, and the first real QEMU deployment path are implemented. Server mode and broader integrations remain planned.
+> Status: the CLI MVP is ready for dogfooding: ordered SSH deployments, health-gated rollback, per-host deployment locks, and durable local run records are implemented. Draining, hooks, extensions, update/scan/inventory, and server mode are not yet implemented.
 
 ## Why
 
@@ -14,11 +14,31 @@ Existing Nix deployment tools (deploy-rs, colmena, clan) copy a closure and run 
 
 cattix fills that gap. It stays a thin layer over Nix and doesn't replace it.
 
+## Current status
+
+Implemented:
+
+- NixOS fleet options and `cattix.lib.mkFleet`, including explicit host-to-configuration mapping.
+- `groups`, `status`, `diff`, `plan`, `deploy`, and single-host `rollback` CLI commands.
+- Ordered, one-host-at-a-time deployment: build, copy, activate, confirm the active closure, and run health checks.
+- Command, HTTP, TCP, and gRPC health checks from the controller or target; target-local network checks use the packaged probe runner.
+- Rollback to the closure saved immediately before a Cattix activation, including automatic rollback after a failed post-deployment check and health verification after every rollback.
+- Per-host remote deployment locks, with the current lock owner reported to a concurrent caller.
+- fsync'd local JSONL run records containing desired and observed closures, events, health outcomes, and final status.
+- A QEMU NixOS integration test covering a successful two-host rollout, idempotency, manual rollback health verification, automatic rollback, rollback-health failure, and lock contention.
+
+Not implemented yet:
+
+- Traffic draining/enabling, group hooks, resumable runs, and distributed leases for a future controller.
+- `update`, `scan`, `inventory`, and `serve`; the CLI accepts these commands but returns an unimplemented error.
+- Extension execution, SBOM/CVE scanning, NetBox/MR integrations, metrics, and the Kubernetes/ArgoCD controller.
+- Revision-aware drift classification: Cattix currently reports only `in-sync`, `drifted`, or `unreachable` from the active closure.
+
 ## Principles
 
 - **Git is the desired state.** Rollout groups, health checks and metadata are NixOS options, exported as one flake output.
 - **Hosts are the actual state.** cattix reads `/run/current-system` (over SSH or from a metric) and never trusts its own records.
-- **No database of its own.** History goes to the systems already in place: Prometheus/Mimir, NetBox, GitLab MRs, S3 for reports.
+- **No long-lived database of its own.** Each CLI run writes an fsync'd local JSONL record; integrations can later export history to Prometheus/Mimir, NetBox, GitLab MRs, or S3.
 - **Shell out to Nix.** Use `nix eval`, `nix build`, `nix copy`, `nvd` and `sbomnix` rather than reimplementing them.
 - **Checks live next to the service.** The module that enables GitLab also declares GitLab's health checks.
 - **Works without the cluster.** The CLI must work even when Kubernetes, GitLab or Vault are down, because those may be the hosts being repaired.
@@ -163,24 +183,30 @@ UTF-8 body text, and a JSONPath value. String matchers use
 apply the same matcher form to `expectedStdout` and `expectedStderr`. Failed attempts include the
 probe's error in both the live step tree and structured event output before Cattix retries.
 
-The module also sets `system.configurationRevision` and can export a `cattix_build_info{rev, nixpkgs_rev, toplevel}` metric, so hosts report what they run without cattix having to connect.
+`mkFleet` includes a host's configured `system.configurationRevision` in the fleet document. Cattix does not currently query that revision from hosts or expose a build-info metric.
 
 ## Commands
 
 ```
 cattix groups                  # list rollout groups and their hosts
-cattix status [--host h | --group g] # per host: in sync / behind / drifted / unreachable
+cattix status [--host h | --group g] # per host: in sync / drifted / unreachable
 cattix diff [--host h | --group g]   # nvd diff of deployed vs git (packages, versions, services)
 cattix plan [--host h | --group g]   # show the rollout order and steps without running them
-cattix deploy [--group g | --host h] # drain → copy → boot entry → switch → checks → re-enable / rollback
-cattix rollback --host h            # activate one host's previous generation, run checks
-cattix update [--host h | --group g] [--input i] [--mr] # update a flake input, build, diff, open a merge request
-cattix scan [--host h | --group g]  # SBOM + CVE scan of each host's system, with ignore list
-cattix inventory [--host h | --group g] [--sync netbox] # push the fields Nix owns into NetBox
-cattix serve                   # exporter / controller mode (see below)
+cattix deploy [--group g | --host h] [--active-closure-timeout 45m]
+                                      # build → copy → switch → checks → rollback on check failure
+cattix rollback --host h [--active-closure-timeout 45m]
+                                      # activate and health-check the Cattix-saved previous generation
+cattix update ...                    # not implemented
+cattix scan ...                      # not implemented
+cattix inventory ...                 # not implemented
+cattix serve                         # not implemented
 ```
 
-Every command also supports `--json` output for CI.
+Every command also supports `--json` output for CI. `deploy` and `rollback` default to a
+20-minute active-closure wait, which is appropriate for slower services such as GitLab; pass
+`--active-closure-timeout 45m` (or a value in `s`, `m`, or `h`) when needed. They write an
+fsync'd JSONL run record under `$XDG_STATE_HOME/cattix/runs` (or
+`~/.local/state/cattix/runs`); use `--report-dir DIR` to choose another location.
 
 Interactive deployments render a retained tree on stderr. Each host contains its deployment
 steps, and build/copy/check output remains directly below the step that produced it. Piped output
@@ -212,36 +238,35 @@ The environment supplies a test-only SSH key to both Cattix and `nix copy`; stop
 ### Drift detection
 
 - The expected build comes from `nix eval` or `nix build` at a git revision.
-- The active system closure comes from each host's `/run/current-system`, alongside `system.configurationRevision`.
+- The active system closure comes from each host's `/run/current-system`.
 - Host states:
   - `in-sync`: running the build from git.
-  - `behind`: running an older commit of the repository.
-  - `drifted`: running a build that matches no known commit, e.g. deployed by hand.
+  - `drifted`: running a different closure.
   - `unreachable`.
-- `diff` shows package and version changes with `nvd`, and service-level changes (systemd units added, removed or changed).
+- Revision-aware `behind` classification is planned; the fleet's `configurationRevision` is not yet probed from the target.
+- `diff` shows the `nvd` report for a changed closure.
 
 ### Rolling deployments
 
-Each host goes through a state machine, one host at a time within a group. Groups run in order.
+Each selected host deploys one at a time, in group/name/order sort order.
 
 - **Diff first:** each selected host's deployed and expected build paths are compared. Hosts already in sync are skipped; `cattix diff` remains the detailed `nvd` report.
 
 ```
-pending → building → copying → draining → activating → checking → enabling → done
-                                              │            │
-                                              └────────────┴──► rolling-back → failed
+pending → building → locking → copying → activating → checking → done
+                                                 │             │
+                                                 └─────────────┴──► rolling-back → rollback-checking → failed
 ```
 
-- **Build:** locally, on a build host, or taken from a binary cache that CI already filled.
+- **Build:** locally through `nix build`; Nix may use configured binary caches.
 - **Activate:** register the new generation as the next boot entry, then run `switch-to-configuration switch`. A failed switch still leaves a bootable configuration, and rollback is an explicit switch to the previous generation.
 - **Health checks:** command, HTTP, TCP, and gRPC probes run on the `controller` or `target`. Target-local network probes use the copied runner. Commands receive an executable and argv rather than a shell string. Every probe retries until its deadline and may set a per-attempt `timeoutMs`. HAProxy and custom probes remain planned.
-- **Draining:** the HAProxy runtime API first; the interface allows other load balancers later.
-- **Failure:** roll back the host, re-run the checks, re-enable it if it's healthy, and stop the rollout. Never continue to the next host.
+- **Failure:** roll back the host's closure, confirm its active closure, rerun its health checks, and stop the rollout. Traffic re-enabling is planned with extensions.
 - **Interruption handling:** after dispatching a switch, Cattix reconnects and confirms the active system instead of assuming failure. A later deterministic deploy repeats the normal diff and is a no-op when that system is already active.
-- **Audit log:** each step is emitted as JSON lines for callers to capture and inspect.
-- **Hooks:** the plan can include pre/post steps per group. Example: GitLab upgrades that need post-deployment migrations run once, after every node in the group is done.
+- **Audit events:** each step is emitted as JSON lines for callers to capture and is fsync'd to a local JSONL run record. Resume support is planned.
+- **Draining and hooks:** group hooks, migration strategies, and load-balancer integration are planned.
 
-### Updates
+### Updates (planned)
 
 - `cattix update --input nixpkgs` updates one input on its own branch, builds every affected host, and writes a report:
   - package and version diff per host
@@ -251,7 +276,7 @@ pending → building → copying → draining → activating → checking → en
 - Each input is updated separately, so pins with different release cadences (e.g. stable nixpkgs vs master for one service) get separate MRs.
 - A check flags new NixOS releases so release upgrades are planned.
 
-### Vulnerability scanning
+### Vulnerability scanning (planned)
 
 - Create a CycloneDX SBOM from each host's system with `sbomnix`, then scan it with `grype` and `vulnix` (OSV and NVD data).
 - An ignore list in the repository (`cattix/vuln-ignore.yaml`) requires a reason and an expiry for every entry. Nixpkgs often patches a CVE without bumping the version, so without this list scanners report fixed CVEs and people stop reading the results.
@@ -262,7 +287,7 @@ pending → building → copying → draining → activating → checking → en
   - optional upload to Dependency-Track
 - Exits non-zero when a new critical or high CVE isn't on the ignore list.
 
-### Inventory
+### Inventory (planned)
 
 - Syncs host facts from the flake into NetBox: name, platform, NixOS release, nixpkgs revision, service versions, desired and active system closures, last deployment.
 - Only updates the fields Nix owns, and never deletes objects or overwrites fields people maintain.
@@ -276,12 +301,13 @@ cattix-nix        leaf adapter: nix eval/build/copy and nvd process calls
 cattix-transport  leaf adapter: OpenSSH process calls
 cattix-utils      shared value-type macro and low-level utilities
 cattix-core       fleet contract, validation, rollout state machine and application service
-cattix-checks     health check trait + built-in kinds
+cattix-cli        clap frontend and terminal/JSON event rendering
+
+# planned crates
 cattix-extension-api versioned API for external checks, drains and hooks
 cattix-extensions-haproxy optional HAProxy drain and health-check extension
 cattix-scan       SBOM, scanners, ignore list, report model
 cattix-sinks      NetBox, GitLab/GitHub MRs, Prometheus, Dependency-Track
-cattix-cli        clap frontend and terminal/JSON event rendering
 cattix-controller kube-rs controller + /metrics (optional)
 ```
 
@@ -336,27 +362,21 @@ A controller mode uses custom resources, so ArgoCD's UI can display the fleet:
 | Deploy | yes | yes | yes | pre-release | yes |
 | Service health checks | SSH only | no | no | no | yes |
 | Rolling / ordered rollout | no | parallel limit | no (parallel) | no | yes |
-| Load balancer draining | no | no | no | no | yes |
-| Automatic rollback | on SSH loss | no | no (boot entry first) | no | on failed checks |
-| Drift detection | no | no | no | no | yes |
-| Update MRs with diff | no | no | no | no | yes |
-| Vulnerability scanning | no | no | no | no | yes |
+| Load balancer draining | no | no | no | no | planned |
+| Automatic rollback | on SSH loss | no | no (boot entry first) | no | closure rollback on failed checks |
+| Drift detection | no | no | no | no | closure comparison |
+| Update MRs with diff | no | no | no | no | planned |
+| Vulnerability scanning | no | no | no | no | planned |
 
 cattix does not do provisioning (use OpenTofu), secrets (use agenix or sops-nix) or disk setup (use disko or nixos-anywhere).
 
 ## Roadmap
 
-1. **Fleet model and status:** NixOS module, `mkFleet`, `status`, `diff`.
-2. **Deploy:** state machine, SSH transport, command/HTTP checks, rollback, `plan`.
-3. **Drain:** generic drain interface, then HAProxy as an optional extension, `haproxy-up` check and group hooks.
-4. **Extensions:** versioned Rust extension API, explicit registration of external crates, capability checks and extension audit events.
-5. **Scan:** sbomnix + grype/vulnix, ignore list, JSON and metrics output.
-6. **Update:** per-input updates, closure diff report, GitLab MR creation.
+1. **Done — fleet model and inspection:** NixOS module, `mkFleet`, `groups`, `status`, `diff`, and `plan`.
+2. **Done — dogfooding deploy MVP:** sequential Nix/SSH rollout, health-gated rollback, post-rollback checks, remote per-host locks, durable local records, and configurable active-closure wait. Resume and controller-oriented distributed leases remain later work.
+3. **Drain and hooks:** generic drain interface, HAProxy extension, `haproxy-up` check, and group hooks.
+4. **Extensions:** versioned Rust extension API, explicit registration of external crates, capability checks, and extension audit events.
+5. **Scan:** sbomnix + grype/vulnix, ignore list, JSON, and metrics output.
+6. **Update:** per-input updates, closure diff report, and GitLab/GitHub MR creation.
 7. **Inventory:** NetBox sync.
-8. **Controller:** CRDs, kube-rs controller, ArgoCD health checks, `/metrics`.
-
-## Open questions
-
-- HTTP checks from the controller vs from the host: which is the default?
-- Multi-node migrations (e.g. GitLab zero-downtime upgrades): a built-in strategy or only generic hooks?
-- Which binary cache to support first: S3 or attic?
+8. **Controller:** metrics, CRDs, kube-rs controller, and ArgoCD health checks.

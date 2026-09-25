@@ -8,7 +8,7 @@ use adapters::{NixDeploymentBackend, SshTransport};
 use anyhow::{Context, Result};
 use cattix_nix::Nix;
 use cattix_transport::OpenSsh;
-use std::fmt;
+use std::{fmt, time::Duration};
 
 pub use health::run_local_health_check;
 
@@ -123,6 +123,7 @@ impl FleetService {
         scope: DeploymentScope<'_>,
         flake: &FlakeRef,
         impure: bool,
+        options: DeploymentOptions,
         reporter: &mut R,
     ) -> Result<()> {
         let builder = NixDeploymentBackend {
@@ -135,6 +136,7 @@ impl FleetService {
             scope,
             &builder,
             &SshTransport { ssh: &self.ssh },
+            options,
             reporter,
         )
     }
@@ -143,9 +145,40 @@ impl FleetService {
         &self,
         fleet: &Fleet,
         scope: DeploymentScope<'_>,
+        flake: &FlakeRef,
+        impure: bool,
+        options: DeploymentOptions,
         reporter: &mut R,
     ) -> Result<()> {
-        rollout::rollback(fleet, scope, &SshTransport { ssh: &self.ssh }, reporter)
+        let builder = NixDeploymentBackend {
+            nix: &self.nix,
+            flake,
+            impure,
+        };
+        rollout::rollback(
+            fleet,
+            scope,
+            &builder,
+            &SshTransport { ssh: &self.ssh },
+            options,
+            reporter,
+        )
+    }
+}
+
+/// Controller-side limits for state transitions that may briefly interrupt SSH.
+#[derive(Debug, Clone, Copy)]
+pub struct DeploymentOptions {
+    pub active_closure_timeout: Duration,
+}
+
+impl Default for DeploymentOptions {
+    fn default() -> Self {
+        Self {
+            // Large NixOS services, including GitLab, can take several minutes to
+            // restart and reconnect. Operators can make this larger from the CLI.
+            active_closure_timeout: Duration::from_secs(20 * 60),
+        }
     }
 }
 
@@ -167,6 +200,8 @@ pub enum DeployStep {
     Finalizing,
     Deploy,
     RollingBack,
+    VerifyingRollback,
+    Locking,
 }
 
 impl DeployStep {
@@ -180,6 +215,8 @@ impl DeployStep {
             Self::Finalizing => "finalizing",
             Self::Deploy => "deploy",
             Self::RollingBack => "rolling-back",
+            Self::VerifyingRollback => "verifying-rollback",
+            Self::Locking => "locking",
         }
     }
 }
@@ -190,7 +227,8 @@ impl fmt::Display for DeployStep {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
 pub enum DeployEvent {
     Started { step: DeployStep },
     Log { step: DeployStep, message: String },
@@ -216,7 +254,7 @@ impl DeployEvent {
 
 /// Receives state-machine events; the CLI and future server render them differently.
 pub trait DeploymentReporter {
-    fn emit(&mut self, host: &str, event: DeployEvent);
+    fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()>;
 
     fn report_step<T>(
         &mut self,
@@ -225,11 +263,24 @@ pub trait DeploymentReporter {
         operation: impl FnOnce(&mut dyn FnMut(&str)) -> Result<T>,
         detail: impl FnOnce(&T) -> String,
     ) -> Result<T> {
-        self.emit(host, DeployEvent::Started { step });
+        self.emit(host, DeployEvent::Started { step })?;
+        let mut report_error = None;
         let result = {
-            let mut report_log = |message: &str| self.emit(host, DeployEvent::log(step, message));
+            let mut report_log = |message: &str| {
+                // The event stream is part of the deployment audit trail. If it
+                // cannot be persisted, stop before the next irreversible step.
+                if report_error.is_none() {
+                    if let Err(error) = self.emit(host, DeployEvent::log(step, message.to_owned()))
+                    {
+                        report_error = Some(error);
+                    }
+                }
+            };
             operation(&mut report_log)
         };
+        if let Some(error) = report_error {
+            return Err(error.context(format!("recording {step} event")));
+        }
 
         match result {
             Ok(value) => {
@@ -239,11 +290,11 @@ pub trait DeploymentReporter {
                         step,
                         detail: detail(&value),
                     },
-                );
+                )?;
                 Ok(value)
             }
             Err(error) => {
-                self.emit(host, DeployEvent::failed(step, error.to_string()));
+                self.emit(host, DeployEvent::failed(step, error.to_string()))?;
                 Err(error)
             }
         }

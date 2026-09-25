@@ -1,13 +1,18 @@
+mod run_record;
+
 use anyhow::{bail, Context, Result};
 use cattix_core::{
-    DeployEvent, DeployStep, DeploymentReporter, DeploymentScope, FlakeRef, Fleet, FleetService,
-    GroupName, HostDiff, HostName, SystemClosure,
+    DeployEvent, DeployStep, DeploymentOptions, DeploymentReporter, DeploymentScope, FlakeRef,
+    Fleet, FleetService, GroupName, HostDiff, HostName, SystemClosure,
 };
 use clap::{Args, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use run_record::{RecordingReporter, RunRecorder};
 use std::{
     collections::HashMap,
     io::{IsTerminal, Write},
+    path::PathBuf,
+    time::Duration,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +31,14 @@ pub struct Cli {
         help = "Allow impure Nix evaluation for controlled local fixtures"
     )]
     impure: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help = "Directory for durable deployment JSONL records (defaults to $XDG_STATE_HOME/cattix/runs)"
+    )]
+    report_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -49,10 +62,26 @@ enum Command {
     Deploy {
         #[command(flatten)]
         scope: FleetScope,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "20m",
+            value_parser = parse_duration,
+            help = "How long to wait for the activated or rolled-back closure (for example 45m)"
+        )]
+        active_closure_timeout: Duration,
     },
     Rollback {
         #[arg(long)]
         host: String,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "20m",
+            value_parser = parse_duration,
+            help = "How long to wait for the rolled-back closure (for example 45m)"
+        )]
+        active_closure_timeout: Duration,
     },
     Update {
         #[command(flatten)]
@@ -103,8 +132,32 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Status { scope } => status(&cli.flake, scope, cli.json, cli.impure),
         Command::Diff { scope } => diff(&cli.flake, scope, cli.json, cli.impure),
         Command::Plan { scope } => plan(&cli.flake, scope, cli.json, cli.impure),
-        Command::Deploy { scope } => deploy(&cli.flake, scope, cli.json, cli.impure),
-        Command::Rollback { host } => rollback(&cli.flake, &host, cli.json, cli.impure),
+        Command::Deploy {
+            scope,
+            active_closure_timeout,
+        } => deploy(
+            &cli.flake,
+            scope,
+            cli.json,
+            cli.impure,
+            cli.report_dir.as_deref(),
+            DeploymentOptions {
+                active_closure_timeout,
+            },
+        ),
+        Command::Rollback {
+            host,
+            active_closure_timeout,
+        } => rollback(
+            &cli.flake,
+            &host,
+            cli.json,
+            cli.impure,
+            cli.report_dir.as_deref(),
+            DeploymentOptions {
+                active_closure_timeout,
+            },
+        ),
         Command::Update { .. }
         | Command::Scan { .. }
         | Command::Inventory { .. }
@@ -275,7 +328,7 @@ fn plan(flake: &str, selection: FleetScope, json: bool, impure: bool) -> Result<
 struct TracingReporter;
 
 impl DeploymentReporter for TracingReporter {
-    fn emit(&mut self, host: &str, event: DeployEvent) {
+    fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match event {
             DeployEvent::Started { step } => tracing::info!(
                 host = %host,
@@ -305,6 +358,7 @@ impl DeploymentReporter for TracingReporter {
                 "deployment event"
             ),
         }
+        Ok(())
     }
 }
 
@@ -400,7 +454,7 @@ impl TerminalReporter {
 }
 
 impl DeploymentReporter for TerminalReporter {
-    fn emit(&mut self, host: &str, event: DeployEvent) {
+    fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match event {
             DeployEvent::Started { step } => {
                 let bar = self.step(host, step);
@@ -422,6 +476,7 @@ impl DeploymentReporter for TerminalReporter {
                 bar.finish_with_message(error);
             }
         }
+        Ok(())
     }
 }
 
@@ -431,7 +486,7 @@ enum CliReporter {
 }
 
 impl DeploymentReporter for CliReporter {
-    fn emit(&mut self, host: &str, event: DeployEvent) {
+    fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match self {
             Self::Terminal(reporter) => reporter.emit(host, event),
             Self::Tracing(reporter) => reporter.emit(host, event),
@@ -447,14 +502,30 @@ fn deployment_reporter(json: bool) -> CliReporter {
     }
 }
 
-fn deploy(flake: &str, selection: FleetScope, json: bool, impure: bool) -> Result<()> {
+fn deploy(
+    flake: &str,
+    selection: FleetScope,
+    json: bool,
+    impure: bool,
+    report_dir: Option<&std::path::Path>,
+    options: DeploymentOptions,
+) -> Result<()> {
     let fleet = load_fleet_config(flake, impure)?;
     let flake = FlakeRef::from(flake);
     let host_name = selection.host.as_deref().map(HostName::from);
     let group = selection.group.as_deref().map(GroupName::from);
     let scope = deployment_scope(host_name.as_ref(), group.as_ref());
-    let mut reporter = deployment_reporter(json);
-    FleetService::default().deploy(&fleet, scope, &flake, impure, &mut reporter)
+    let mut recorder =
+        RunRecorder::start(report_dir, "deploy", flake.as_str(), &fleet, scope, options)?;
+    if !json {
+        tracing::info!(report = %recorder.path().display(), "writing durable deployment record");
+    }
+    let mut reporter = RecordingReporter::new(deployment_reporter(json), &mut recorder);
+    let result =
+        FleetService::default().deploy(&fleet, scope, &flake, impure, options, &mut reporter);
+    drop(reporter);
+    recorder.finish(&result)?;
+    result
 }
 
 fn deployment_scope<'a>(
@@ -469,16 +540,57 @@ fn deployment_scope<'a>(
     }
 }
 
-fn rollback(flake: &str, host_name: &str, json: bool, impure: bool) -> Result<()> {
+fn rollback(
+    flake: &str,
+    host_name: &str,
+    json: bool,
+    impure: bool,
+    report_dir: Option<&std::path::Path>,
+    options: DeploymentOptions,
+) -> Result<()> {
     let fleet = load_fleet_config(flake, impure)?;
     let host_name = HostName::from(host_name);
-    let mut reporter = deployment_reporter(json);
-    FleetService::default().rollback(&fleet, DeploymentScope::Host(&host_name), &mut reporter)
+    let scope = DeploymentScope::Host(&host_name);
+    let mut recorder = RunRecorder::start(report_dir, "rollback", flake, &fleet, scope, options)?;
+    if !json {
+        tracing::info!(report = %recorder.path().display(), "writing durable deployment record");
+    }
+    let flake = FlakeRef::from(flake);
+    let mut reporter = RecordingReporter::new(deployment_reporter(json), &mut recorder);
+    let result =
+        FleetService::default().rollback(&fleet, scope, &flake, impure, options, &mut reporter);
+    drop(reporter);
+    recorder.finish(&result)?;
+    result
+}
+
+fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (amount, unit) = value.split_at(split);
+    let amount = amount
+        .parse::<u64>()
+        .map_err(|_| "duration must start with a positive integer".to_owned())?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".into());
+    }
+    let seconds = match unit {
+        "s" => amount,
+        "m" => amount
+            .checked_mul(60)
+            .ok_or_else(|| "duration is too large".to_owned())?,
+        "h" => amount
+            .checked_mul(60 * 60)
+            .ok_or_else(|| "duration is too large".to_owned())?,
+        _ => return Err("duration must use s, m, or h (for example 45m)".into()),
+    };
+    Ok(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Command};
     use clap::Parser;
 
     #[test]
@@ -510,5 +622,17 @@ mod tests {
     fn rollback_uses_the_standard_host_flag() {
         assert!(Cli::try_parse_from(["cattix", "rollback", "--host", "app-primary"]).is_ok());
         assert!(Cli::try_parse_from(["cattix", "rollback", "app-primary"]).is_err());
+    }
+
+    #[test]
+    fn active_closure_timeout_accepts_human_scale_durations() {
+        let cli =
+            Cli::try_parse_from(["cattix", "deploy", "--active-closure-timeout", "45m"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Deploy { active_closure_timeout, .. } if active_closure_timeout == std::time::Duration::from_secs(45 * 60))
+        );
+        assert!(
+            Cli::try_parse_from(["cattix", "deploy", "--active-closure-timeout", "0m",]).is_err()
+        );
     }
 }
