@@ -89,12 +89,14 @@ cattix = {
 };
 ```
 
-A library function collects explicitly selected NixOS configurations into one fleet output. Each
+A library function collects explicitly selected NixOS configurations into one fleet output. In
+the example below, the flake input is named `cattixInput` so it is easy to distinguish from the
+top-level `cattix` fleet output. Each
 host key becomes the Cattix host name; its value is the corresponding NixOS configuration. Cattix
 derives the expected system closure and host-level options itself:
 
 ```nix
-cattix = cattix.lib.mkFleet {
+cattix = cattixInput.lib.mkFleet {
   hosts = {
     gitlab-standby = self.nixosConfigurations.gitlab1;
     gitlab-primary = self.nixosConfigurations.gitlab2;
@@ -103,7 +105,7 @@ cattix = cattix.lib.mkFleet {
 ```
 
 For fleets where every configuration is managed by Cattix, the existing shorthand remains
-available: `cattix.lib.mkFleet { inherit (self) nixosConfigurations; }`.
+available: `cattixInput.lib.mkFleet { inherit (self) nixosConfigurations; }`.
 
 Here is a complete flake shape using explicit hosts. The files in `./hosts/` contain the usual
 machine-specific NixOS configuration (hardware, boot, users, and services).
@@ -114,17 +116,17 @@ machine-specific NixOS configuration (hardware, boot, users, and services).
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    cattix.url = "github:your-org/cattix";
+    cattixInput.url = "github:Code-Growers/cattix";
   };
 
-  outputs = { self, nixpkgs, cattix, ... }:
+  outputs = { self, nixpkgs, cattixInput, ... }:
     let
       system = "x86_64-linux";
       mkHost = { module, group, order, target }:
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
-            cattix.nixosModules.default
+            cattixInput.nixosModules.default
             module
             ({ ... }: {
               cattix = {
@@ -162,17 +164,20 @@ machine-specific NixOS configuration (hardware, boot, users, and services).
         };
       };
 
-      cattix = cattix.lib.mkFleet {
+      # Keep the top-level fleet output separate from the imported CLI package.
+      cattix = cattixInput.lib.mkFleet {
         hosts = {
           gitlab1 = self.nixosConfigurations.gitlab1;
           gitlab2 = self.nixosConfigurations.gitlab2;
         };
       };
+
+      packages.${system}.cattix-cli = cattixInput.packages.${system}.default;
     };
 }
 ```
 
-`nix eval .#cattix --json` returns the whole fleet model: hosts, groups, order, checks, metadata, and the expected system build for each host.
+The input uses the name `cattixInput` to distinguish it from the top-level fleet output. The CLI package is exposed as `packages.<system>.cattix-cli`, keeping the two interfaces explicit: use `nix eval .#.cattix --json` for the fleet model, and `nix run .#cattix-cli -- --flake . groups` for the CLI. Cattix also uses this exact-root syntax internally so a package with the same name cannot override the fleet data.
 
 Command, HTTP, TCP, and gRPC probes can run on the controller or target. Target-local network
 probes copy `cattix-probe-runner` to the target through Nix, then execute the ZeroNine probe in

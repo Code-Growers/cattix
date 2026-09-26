@@ -21,15 +21,15 @@ The CLI MVP is ready for dogfooding. Implemented commands are `groups`, `status`
 
 ## How it works
 
-The desired fleet is exported by the flake as `.#cattix`. It includes each host's expected NixOS system closure, rollout group and order, SSH target, metadata, and health checks. Cattix reads the active system from `/run/current-system` over SSH. A local invocation builds the desired system, copies it to the target, activates it, confirms the active closure, and runs configured checks. A successful host is followed by the next host in rollout order. If a host fails after activation, Cattix restores the closure that was active before that Cattix activation, verifies the closure, re-runs health checks, and stops the rollout.
+The desired fleet is exported by the flake as the root output `cattix`. Cattix selects it explicitly with `.#.cattix`, avoiding Nix's package-prefix fallback if the consuming flake also exports a package named `cattix`. The fleet includes each host's expected NixOS system closure, rollout group and order, SSH target, metadata, and health checks. Cattix reads the active system from `/run/current-system` over SSH. A local invocation builds the desired system, copies it to the target, activates it, confirms the active closure, and runs configured checks. A successful host is followed by the next host in rollout order. If a host fails after activation, Cattix restores the closure that was active before that Cattix activation, verifies the closure, re-runs health checks, and stops the rollout.
 
 Each deployment writes an fsync'd JSON Lines run record to `$XDG_STATE_HOME/cattix/runs`, or `~/.local/state/cattix/runs` when `XDG_STATE_HOME` is unset. Use `--report-dir DIR` to select another location. The record contains desired and observed closures, events, health outcomes, and final status. It is local to the machine running Cattix; it is not a shared database.
 
 ## Requirements
 
-- Nix with flakes enabled, and a Linux controller for deployment.
+- Nix 2.19 or newer with flakes enabled, and a Linux controller for deployment. Cattix uses Nix's exact-root flake reference syntax to select the fleet output reliably.
 - OpenSSH client access from the controller to each managed host.
-- A NixOS flake that exports `.#cattix` and builds each configured host.
+- A NixOS flake that exports a top-level `cattix` fleet output and builds each configured host.
 - SSH credentials for the target user. `nix copy` must also be able to authenticate to the destination.
 - `nvd` for package and version diffs (`cattix diff`).
 - When running Cattix through its Nix package, the packaged `cattix-probe-runner` is available for target-local network probes. A plain `cargo run` development build does not package that runner.
@@ -46,17 +46,17 @@ Add Cattix as a flake input and import its default NixOS module into each manage
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    cattix.url = "github:Code-Growers/cattix";
+    cattixInput.url = "github:Code-Growers/cattix";
   };
 
-  outputs = { self, nixpkgs, cattix, ... }:
+  outputs = { self, nixpkgs, cattixInput, ... }:
     let
       system = "x86_64-linux";
       mkHost = { module, order, target }:
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
-            cattix.nixosModules.default
+            cattixInput.nixosModules.default
             module
             ({ ... }: {
               cattix = {
@@ -95,21 +95,27 @@ Add Cattix as a flake input and import its default NixOS module into each manage
         };
       };
 
-      cattix = cattix.lib.mkFleet {
+      # Reserve the top-level `cattix` output for the fleet model.
+      cattix = cattixInput.lib.mkFleet {
         hosts = {
           inherit (self.nixosConfigurations) gitlab-standby gitlab-primary;
         };
       };
+
+      # Expose the Cattix CLI under a distinct package name.
+      packages.${system}.cattix-cli = cattixInput.packages.${system}.default;
     };
 }
 ```
 
-`cattix.lib.mkFleet` accepts either an explicit `hosts` attribute set or the shorthand `nixosConfigurations` set, but not both. Explicit `hosts` let the names used by Cattix differ from the names of NixOS configurations. Each host key becomes its Cattix host name. The output is a versioned fleet object containing `hosts` and `groups`.
+The input is called `cattixInput` to distinguish it from the top-level `cattix` fleet output. The CLI is exposed as `packages.<system>.cattix-cli`, keeping the two interfaces explicit: use `nix eval .#.cattix --json` for the fleet model and `nix run .#cattix-cli -- --flake . groups` for the CLI.
+
+`cattixInput.lib.mkFleet` accepts either an explicit `hosts` attribute set or the shorthand `nixosConfigurations` set, but not both. Explicit `hosts` let the names used by Cattix differ from the names of NixOS configurations. Each host key becomes its Cattix host name. The output is a versioned fleet object containing `hosts` and `groups`.
 
 Evaluate the exported model with:
 
 ```sh
-nix eval .#cattix --json
+nix eval .#.cattix --json
 ```
 
 The Cattix NixOS module supports `cattix.group`, `cattix.order`, `cattix.target`, `cattix.metadata`, and `cattix.healthChecks`. `target.host` is the SSH address; `target.port` defaults to `22`, and `target.user` defaults to `root`. Metadata fields are `environment`, `criticality`, and `owner`. Cattix does not provision SSH keys or users.

@@ -93,6 +93,14 @@ let
           };
         in {
           inherit nixosConfigurations;
+          # Regression: the fleet adapter must select the root `cattix` data
+          # output even when a package with the same short name is present.
+          packages.x86_64-linux.cattix = builtins.derivation {
+            name = "cattix-package-name-collision";
+            system = "x86_64-linux";
+            builder = "/bin/sh";
+            args = [ "-c" "mkdir -p $out" ];
+          };
           cattix = {
             version = 1;
             hosts = [

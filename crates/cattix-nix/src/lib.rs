@@ -16,7 +16,7 @@ impl Nix {
     /// Evaluates a flake attribute and returns its JSON document unchanged.
     /// Interpretation of that document belongs to the calling application.
     pub fn eval_json(&self, flake: &str, attribute: &str, impure: bool) -> Result<Vec<u8>> {
-        let expression = format!("{flake}#{attribute}");
+        let expression = exact_flake_attribute(flake, attribute);
         let mut args = vec!["eval", expression.as_str(), "--json"];
         if impure {
             args.push("--impure");
@@ -68,7 +68,7 @@ impl Nix {
         mut on_log: impl FnMut(&str),
     ) -> Result<String> {
         let attribute = format!("nixosConfigurations.{host_name}.config.system.build.toplevel");
-        let expression = format!("{flake}#{attribute}");
+        let expression = exact_flake_attribute(flake, &attribute);
         let mut args = vec![
             "build",
             expression.as_str(),
@@ -196,6 +196,29 @@ impl Nix {
             .to_str()
             .context("cattix probe runner path is not valid UTF-8")?
             .to_owned())
+    }
+}
+
+/// Select a flake output attribute without Nix's package-prefix fallback.
+/// Fleet data such as `cattix` must remain distinct from installable packages.
+fn exact_flake_attribute(flake: &str, attribute: &str) -> String {
+    format!("{flake}#.{attribute}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exact_flake_attribute;
+
+    #[test]
+    fn flake_attributes_are_selected_from_the_output_root() {
+        assert_eq!(exact_flake_attribute(".", "cattix"), ".#.cattix");
+        assert_eq!(
+            exact_flake_attribute(
+                "/tmp/fleet",
+                "nixosConfigurations.host.config.system.build.toplevel"
+            ),
+            "/tmp/fleet#.nixosConfigurations.host.config.system.build.toplevel"
+        );
     }
 }
 
