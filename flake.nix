@@ -102,6 +102,7 @@
               pkgs.clang
               pkgs.sccache
               pkgs.nvd
+              pkgs.nodejs
 
               (fenixSys.complete.withComponents [
                 "cargo"

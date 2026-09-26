@@ -4,6 +4,10 @@ Fleet management for NixOS hosts: inventory, drift detection, updates, vulnerabi
 
 > Status: the CLI MVP is ready for dogfooding: ordered SSH deployments, health-gated rollback, per-host deployment locks, and durable local run records are implemented. Draining, hooks, extensions, update/scan/inventory, and server mode are not yet implemented.
 
+## Documentation
+
+The [project documentation](docs/src/content/docs/index.md) is a single Starlight page. It includes the Nix flake interface, health checks, CLI, deployment behavior, and current project status. The site also publishes a plain Markdown version at `/llms.txt` for language-model ingestion. GitHub Actions builds the site on pull requests and publishes it to GitHub Pages from `main`.
+
 ## Why
 
 Existing Nix deployment tools (deploy-rs, colmena, clan) copy a closure and run `switch-to-configuration`. None of them can express how a real service should be rolled out:

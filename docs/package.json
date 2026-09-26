@@ -1,0 +1,15 @@
+{
+  "name": "cattix-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev --host --base /",
+    "prebuild": "node scripts/prepare-llms.mjs",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.42.4",
+    "astro": "^7.2.10"
+  }
+}
