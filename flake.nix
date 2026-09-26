@@ -55,12 +55,17 @@
             version = "0.1.0";
             src = craneLib.cleanCargoSource ./.;
             nativeBuildInputs = [
+              pkgs.makeWrapper
               pkgs.sccache
               pkgs.clang
               pkgs.mold
               pkgs.pkg-config
             ];
             buildInputs = [ openssl_pkgs.dev ];
+            postInstall = ''
+              wrapProgram $out/bin/cattix \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix pkgs.nvd ]}
+            '';
             cargoBuildCommand = "cargo build --profile release --bins";
             cargoInstallCommand = "cargo install --path . --root $out --bins";
           };

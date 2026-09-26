@@ -31,7 +31,7 @@ Each deployment writes an fsync'd JSON Lines run record to `$XDG_STATE_HOME/catt
 - OpenSSH client access from the controller to each managed host.
 - A NixOS flake that exports a top-level `cattix` fleet output and builds each configured host.
 - SSH credentials for the target user. `nix copy` must also be able to authenticate to the destination.
-- `nvd` for package and version diffs (`cattix diff`).
+- The packaged CLI includes `nix` and `nvd` on its runtime `PATH`. If running from Cargo, install Nix and `nvd` separately; `nvd` powers package/version diffs (`cattix diff`).
 - When running Cattix through its Nix package, the packaged `cattix-probe-runner` is available for target-local network probes. A plain `cargo run` development build does not package that runner.
 
 The controller and target must currently use the same platform when target-local HTTP, TCP, or gRPC checks need the probe runner. Per-host runner builds for mixed-architecture fleets are planned.
