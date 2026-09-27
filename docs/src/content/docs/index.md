@@ -30,7 +30,7 @@ Each deployment writes an fsync'd JSON Lines run record to `$XDG_STATE_HOME/catt
 - Nix 2.19 or newer with flakes enabled, and a Linux controller for deployment. Cattix uses Nix's exact-root flake reference syntax to select the fleet output reliably.
 - OpenSSH client access from the controller to each managed host.
 - A NixOS flake that exports a top-level `cattix` fleet output and builds each configured host.
-- SSH credentials for the target user. `nix copy` must also be able to authenticate to the destination.
+- SSH credentials for the target user. `nix copy` must be able to access the target Nix store for deployment and for copying an active closure back to the controller during `diff`. On that host-to-controller copy, Cattix accepts paths from the explicitly selected SSH store even if they lack signatures trusted by the controller; SSH host identity and credentials are therefore part of the trust boundary.
 - The packaged CLI includes `nix` and `nvd` on its runtime `PATH`. If running from Cargo, install Nix and `nvd` separately; `nvd` powers package/version diffs (`cattix diff`).
 - When running Cattix through its Nix package, the packaged `cattix-probe-runner` is available for target-local network probes. A plain `cargo run` development build does not package that runner.
 
@@ -188,13 +188,15 @@ cattix --flake . rollback --host gitlab-standby
 | --- | --- |
 | `groups` | List rollout groups and their hosts. |
 | `status [--host HOST | --group GROUP]` | Compare active and expected system closures; reports `in-sync`, `drifted`, or `unreachable`. With no scope, inspect the full fleet. |
-| `diff [--host HOST | --group GROUP]` | Show an `nvd` package/version diff between active and expected closures. |
+| `diff [--host HOST | --group GROUP]` | Build the expected closure if needed, copy the active closure from the target if needed, then show the `nvd` package/version diff. |
 | `plan [--host HOST | --group GROUP]` | Show the selected rollout order and steps without deploying. |
-| `deploy [--host HOST | --group GROUP]` | Build, copy, activate, and health-check selected hosts in order; a failed post-activation check triggers rollback and stops the rollout. With no scope, deploy the full fleet. |
+| `deploy [--host HOST | --group GROUP] [--dry-run] [--force]` | Build, copy, activate, and health-check selected hosts in order; a failed post-activation check triggers rollback and stops the rollout. `--dry-run` previews closure changes without modifying hosts. `--force` deploys even when active and expected closure paths match. With no scope, deploy the full fleet. |
 | `rollback --host HOST` | Activate and health-check the closure saved before the most recent Cattix activation on that host. |
 | `update`, `scan`, `inventory`, `serve` | Reserved CLI commands; not implemented yet. |
 
 `--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments render a retained tree on stderr. JSON output and piped event output are structured for automation.
+
+In interactive mode, the rolling build/deployment log window is limited to one third of the terminal height and retains the latest output; older lines are summarized. JSON and piped output are not truncated.
 
 ## Deployment behavior
 
@@ -210,7 +212,11 @@ Hosts are processed one at a time, sorted by rollout group, host name, and confi
 
 If activation or post-deployment checks fail after a switch, Cattix restores the saved closure, confirms it is active, runs the host's checks against the restored system, records rollback outcomes, and stops before updating later hosts. Cattix does not currently drain traffic or run group hooks around activation.
 
-The `diff` command uses `nvd` for package/version detail. The current drift classification uses active closure paths; the fleet includes `system.configurationRevision`, but Cattix does not query that revision from hosts yet. The QEMU NixOS integration scenario covers a two-host rollout, idempotency, manual rollback, automatic rollback, rollback health failure, and lock contention.
+`deploy --dry-run` reads active closures, builds expected closures locally, and shows `nvd` diffs for hosts that would change. It does not acquire remote deployment locks, copy the expected closure to a host, activate a system, or run health checks. Local Nix builds and imports of active closure paths are still possible; this is a preview, not a guarantee that a later deployment will succeed. Combine it with `--force` to preview a forced activation of every selected host, including hosts with no closure difference.
+
+`deploy --force` bypasses the no-change skip and runs the regular build, lock, copy, activation, and health-check flow for every selected host. Use it to re-run activation or health checks when the expected system closure is already active.
+
+The `diff` command runs `nix build` for the expected host configuration so the desired closure is available locally, copies the active closure from the host's Nix store with `nix copy --from`, then runs `nvd` on the controller. This can take time and local disk space when either closure is not already present. The current drift classification uses active closure paths; the fleet includes `system.configurationRevision`, but Cattix does not query that revision from hosts yet. The QEMU NixOS integration scenario covers a two-host rollout, idempotency, manual rollback, automatic rollback, rollback health failure, and lock contention.
 
 ## Manual VM lab
 

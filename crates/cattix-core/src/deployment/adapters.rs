@@ -80,7 +80,7 @@ fn ssh_target(host: &Host) -> Result<SshTarget> {
     })
 }
 
-fn nix_destination(host: &Host) -> Result<String> {
+pub(super) fn nix_destination(host: &Host) -> Result<String> {
     let target = ssh_target(host)?;
     if target.port == 22 {
         Ok(format!("ssh://{}@{}", target.user, target.address))

@@ -51,13 +51,15 @@ pub(super) fn deploy<R: DeploymentReporter>(
             |changed| {
                 if *changed {
                     "changes detected".into()
+                } else if options.force {
+                    "no changes; forced deployment".into()
                 } else {
                     "no changes; skipping deployment".into()
                 }
             },
         )?;
 
-        if !changes_detected {
+        if !changes_detected && !options.force {
             continue;
         }
         if let Err(error) = deploy_host(host, builder, transport, options, reporter) {
@@ -582,6 +584,48 @@ mod tests {
         }
     }
 
+    struct SameClosureTransport {
+        active: SystemClosure,
+    }
+
+    impl Transport for SameClosureTransport {
+        fn run(&self, _: &Host, command: &str) -> Result<CommandOutput> {
+            assert_eq!(command, "readlink /run/current-system");
+            Ok(CommandOutput {
+                status: 0,
+                stdout: format!("{}\n", self.active),
+                stderr: String::new(),
+            })
+        }
+
+        fn run_with_input(&self, _: &Host, _: &str, _: &[u8]) -> Result<CommandOutput> {
+            unreachable!("a no-change deployment does not run target probes")
+        }
+
+        fn destination(&self, _: &Host) -> Result<String> {
+            Ok("root@app".into())
+        }
+    }
+
+    struct FailingBuilder {
+        build_count: Cell<usize>,
+    }
+
+    impl Builder for FailingBuilder {
+        fn build(&self, _: &Host, _: &mut dyn FnMut(&str)) -> Result<SystemClosure> {
+            self.build_count.set(self.build_count.get() + 1);
+            bail!("forced build reached")
+        }
+
+        fn copy_to(&self, _: &SystemClosure, _: &Host) -> Result<()> {
+            unreachable!("the test builder fails before copying")
+        }
+
+        fn copy_probe_runner(&self, _: &Host, _: &mut dyn FnMut(&str)) -> Result<String> {
+            unreachable!("the test builder fails before copying")
+        }
+    }
+
     fn host() -> Host {
         Host {
             name: HostName::from("app"),
@@ -628,5 +672,50 @@ mod tests {
             .err()
             .expect("a held deployment lock must reject a concurrent run");
         assert!(format!("{error:#}").contains("held by another-run"));
+    }
+
+    #[test]
+    fn force_deploys_even_when_active_closure_matches() {
+        let host = host();
+        let fleet = Fleet {
+            version: 1,
+            hosts: vec![host.clone()],
+            groups: Default::default(),
+        };
+        let transport = SameClosureTransport {
+            active: host.desired_system_closure.clone(),
+        };
+        let builder = FailingBuilder {
+            build_count: Cell::new(0),
+        };
+        let mut reporter = TestReporter;
+
+        let skipped = deploy(
+            &fleet,
+            DeploymentScope::All,
+            &builder,
+            &transport,
+            DeploymentOptions {
+                active_closure_timeout: Duration::from_secs(1),
+                force: false,
+            },
+            &mut reporter,
+        );
+        assert!(skipped.is_ok());
+        assert_eq!(builder.build_count.get(), 0);
+
+        let forced = deploy(
+            &fleet,
+            DeploymentScope::All,
+            &builder,
+            &transport,
+            DeploymentOptions {
+                active_closure_timeout: Duration::from_secs(1),
+                force: true,
+            },
+            &mut reporter,
+        );
+        assert!(forced.is_err());
+        assert_eq!(builder.build_count.get(), 1);
     }
 }

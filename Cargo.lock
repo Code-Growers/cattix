@@ -204,6 +204,7 @@ dependencies = [
  "anyhow",
  "cattix-core",
  "clap",
+ "console",
  "indicatif",
  "serde",
  "serde_json",
@@ -222,6 +223,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "zeronine_probes",
 ]
 

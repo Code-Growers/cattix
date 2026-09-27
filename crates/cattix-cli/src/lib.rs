@@ -6,10 +6,11 @@ use cattix_core::{
     Fleet, FleetService, GroupName, HostDiff, HostName, SystemClosure,
 };
 use clap::{Args, Parser, Subcommand};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use console::Term;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use run_record::{RecordingReporter, RunRecorder};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{IsTerminal, Write},
     path::PathBuf,
     time::Duration,
@@ -62,6 +63,10 @@ enum Command {
     Deploy {
         #[command(flatten)]
         scope: FleetScope,
+        #[arg(long, help = "Preview closure changes without changing managed hosts")]
+        dry_run: bool,
+        #[arg(long, help = "Deploy even when the active and expected closures match")]
+        force: bool,
         #[arg(
             long,
             value_name = "DURATION",
@@ -134,17 +139,27 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Plan { scope } => plan(&cli.flake, scope, cli.json, cli.impure),
         Command::Deploy {
             scope,
+            dry_run,
+            force,
             active_closure_timeout,
-        } => deploy(
-            &cli.flake,
-            scope,
-            cli.json,
-            cli.impure,
-            cli.report_dir.as_deref(),
-            DeploymentOptions {
+        } => {
+            let options = DeploymentOptions {
                 active_closure_timeout,
-            },
-        ),
+                force,
+            };
+            if dry_run {
+                dry_run_deploy(&cli.flake, scope, cli.json, cli.impure, force)
+            } else {
+                deploy(
+                    &cli.flake,
+                    scope,
+                    cli.json,
+                    cli.impure,
+                    cli.report_dir.as_deref(),
+                    options,
+                )
+            }
+        }
         Command::Rollback {
             host,
             active_closure_timeout,
@@ -156,6 +171,7 @@ fn execute(cli: Cli) -> Result<()> {
             cli.report_dir.as_deref(),
             DeploymentOptions {
                 active_closure_timeout,
+                force: false,
             },
         ),
         Command::Update { .. }
@@ -274,8 +290,12 @@ fn diff(flake: &str, selection: FleetScope, json: bool, impure: bool) -> Result<
     let has_host_selection = selection.host.is_some();
     let host_name = selection.host.as_deref().map(HostName::from);
     let group = selection.group.as_deref().map(GroupName::from);
-    let reports = FleetService::default()
-        .diff(&fleet, deployment_scope(host_name.as_ref(), group.as_ref()))?;
+    let reports = FleetService::default().diff(
+        &fleet,
+        deployment_scope(host_name.as_ref(), group.as_ref()),
+        &FlakeRef::from(flake),
+        impure,
+    )?;
 
     if json {
         let output = if has_host_selection {
@@ -325,6 +345,88 @@ fn plan(flake: &str, selection: FleetScope, json: bool, impure: bool) -> Result<
     Ok(())
 }
 
+fn dry_run_deploy(
+    flake: &str,
+    selection: FleetScope,
+    json: bool,
+    impure: bool,
+    force: bool,
+) -> Result<()> {
+    let fleet = load_fleet_config(flake, impure)?;
+    let host_name = selection.host.as_deref().map(HostName::from);
+    let group = selection.group.as_deref().map(GroupName::from);
+    let scope = deployment_scope(host_name.as_ref(), group.as_ref());
+    let service = FleetService::default();
+    let plan = service.plan(&fleet, scope)?;
+    let diffs = service.diff(&fleet, scope, &FlakeRef::from(flake), impure)?;
+    if force {
+        for (step, diff) in plan.iter().zip(&diffs) {
+            if diff.report.is_none() {
+                let built =
+                    service.build_expected_host(&FlakeRef::from(flake), &step.host, impure)?;
+                if built != diff.expected {
+                    bail!(
+                        "flake evaluation expected {}, but building {} produced {}",
+                        diff.expected,
+                        step.host,
+                        built
+                    );
+                }
+            }
+        }
+    }
+
+    if json {
+        let hosts = plan
+            .iter()
+            .zip(&diffs)
+            .map(|(step, diff)| {
+                serde_json::json!({
+                    "position": step.position,
+                    "host": step.host,
+                    "group": step.group,
+                    "order": step.order,
+                    "steps": step.steps,
+                    "would_deploy": force || diff.report.is_some(),
+                    "forced": force,
+                    "deployed": diff.deployed,
+                    "expected": diff.expected,
+                    "report": diff.report,
+                })
+            })
+            .collect::<Vec<_>>();
+        write_json(&serde_json::json!({
+            "dry_run": true,
+            "hosts": hosts,
+        }))?;
+    } else {
+        tracing::info!(
+            "dry run only: no managed host will be changed; desired closures may be built locally"
+        );
+        for (step, diff) in plan.iter().zip(&diffs) {
+            tracing::info!(
+                position = step.position,
+                host = %step.host,
+                group = step.group.as_ref().map(GroupName::as_str),
+                order = step.order.value(),
+                would_deploy = force || diff.report.is_some(),
+                forced = force,
+                deployed = %diff.deployed,
+                expected = %diff.expected,
+                "dry-run host"
+            );
+            if let Some(report) = &diff.report {
+                tracing::info!(host = %diff.host, report = %report, "build diff");
+            }
+        }
+        if plan.is_empty() {
+            tracing::info!("no hosts matched");
+        }
+    }
+
+    Ok(())
+}
+
 struct TracingReporter;
 
 impl DeploymentReporter for TracingReporter {
@@ -366,7 +468,10 @@ struct TerminalReporter {
     progress: MultiProgress,
     hosts: HashMap<String, HostTree>,
     steps: HashMap<(String, DeployStep), ProgressBar>,
-    lines: Vec<ProgressBar>,
+    max_log_lines: usize,
+    visible_log_lines: VecDeque<ProgressBar>,
+    suppressed_log_lines: usize,
+    log_summary: Option<ProgressBar>,
 }
 
 struct HostTree {
@@ -375,11 +480,17 @@ struct HostTree {
 
 impl TerminalReporter {
     fn new() -> Self {
+        let rows = Term::stderr().size().0 as usize;
         Self {
-            progress: MultiProgress::new(),
+            // Limit terminal refreshes so bursty child-process output can't
+            // make the retained progress tree flicker.
+            progress: MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8)),
             hosts: HashMap::new(),
             steps: HashMap::new(),
-            lines: Vec::new(),
+            max_log_lines: terminal_log_height(rows),
+            visible_log_lines: VecDeque::new(),
+            suppressed_log_lines: 0,
+            log_summary: None,
         }
     }
 
@@ -423,14 +534,60 @@ impl TerminalReporter {
         self.step(host, step);
 
         for message in message.lines().filter(|line| !line.is_empty()) {
-            let tail = self.host_tail(host);
-            let line = self
-                .progress
-                .insert_after(&tail, ProgressBar::new_spinner());
-            line.set_style(Self::log_style());
-            line.finish_with_message(message.to_owned());
-            self.append(host, line.clone());
-            self.lines.push(line);
+            if self.log_summary.is_some() {
+                if self.max_log_lines > 1 {
+                    self.hide_oldest_log_line();
+                    self.add_log_line(host, step, message);
+                } else {
+                    self.suppressed_log_lines += 1;
+                }
+                self.update_log_summary();
+                continue;
+            }
+
+            if self.visible_log_lines.len() < self.max_log_lines {
+                self.add_log_line(host, step, message);
+            } else if self.max_log_lines == 1 {
+                self.hide_oldest_log_line();
+                self.suppressed_log_lines += 1;
+                self.create_log_summary();
+            } else {
+                while self.visible_log_lines.len() > self.max_log_lines - 2 {
+                    self.hide_oldest_log_line();
+                }
+                self.add_log_line(host, step, message);
+                self.create_log_summary();
+            }
+        }
+    }
+
+    fn add_log_line(&mut self, host: &str, step: DeployStep, message: &str) {
+        let line = self.progress.add(ProgressBar::new_spinner());
+        line.set_style(Self::log_style());
+        line.finish_with_message(format!("{host} {step}: {message}"));
+        self.visible_log_lines.push_back(line);
+    }
+
+    fn hide_oldest_log_line(&mut self) {
+        if let Some(oldest) = self.visible_log_lines.pop_front() {
+            self.progress.remove(&oldest);
+            self.suppressed_log_lines += 1;
+        }
+    }
+
+    fn create_log_summary(&mut self) {
+        let summary = self.progress.add(ProgressBar::new(1));
+        summary.set_style(Self::log_style());
+        self.log_summary = Some(summary);
+        self.update_log_summary();
+    }
+
+    fn update_log_summary(&self) {
+        if let Some(summary) = &self.log_summary {
+            summary.set_message(format!(
+                "… {} earlier log lines hidden (showing latest output)",
+                self.suppressed_log_lines
+            ));
         }
     }
 
@@ -492,6 +649,10 @@ impl DeploymentReporter for CliReporter {
             Self::Tracing(reporter) => reporter.emit(host, event),
         }
     }
+}
+
+fn terminal_log_height(rows: usize) -> usize {
+    (rows / 3).max(1)
 }
 
 fn deployment_reporter(json: bool) -> CliReporter {
@@ -590,8 +751,33 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{terminal_log_height, Cli, Command, DeployStep, TerminalReporter};
     use clap::Parser;
+    use indicatif::{MultiProgress, ProgressDrawTarget};
+
+    #[test]
+    fn terminal_log_window_uses_one_third_of_the_screen() {
+        assert_eq!(terminal_log_height(24), 8);
+        assert_eq!(terminal_log_height(60), 20);
+        assert_eq!(terminal_log_height(2), 1);
+    }
+
+    #[test]
+    fn terminal_logs_are_bounded_and_keep_the_latest_lines() {
+        let mut reporter = TerminalReporter::new();
+        reporter.progress = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        reporter.max_log_lines = 4;
+
+        reporter.log(
+            "app",
+            DeployStep::Building,
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven",
+        );
+
+        assert_eq!(reporter.visible_log_lines.len(), 3);
+        assert_eq!(reporter.suppressed_log_lines, 4);
+        assert!(reporter.log_summary.is_some());
+    }
 
     #[test]
     fn fleet_commands_share_host_and_group_selection() {
@@ -634,5 +820,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cattix", "deploy", "--active-closure-timeout", "0m",]).is_err()
         );
+    }
+
+    #[test]
+    fn deploy_accepts_dry_run_flag() {
+        let cli = Cli::try_parse_from(["cattix", "deploy", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Command::Deploy { dry_run: true, .. }));
+    }
+
+    #[test]
+    fn deploy_accepts_force_flag() {
+        let cli = Cli::try_parse_from(["cattix", "deploy", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Deploy { force: true, .. }));
     }
 }

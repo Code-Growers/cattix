@@ -4,8 +4,8 @@ mod health;
 mod rollout;
 
 use crate::{FlakeRef, Fleet, GroupName, Host, HostName, HostState, RolloutOrder, SystemClosure};
-use adapters::{NixDeploymentBackend, SshTransport};
-use anyhow::{Context, Result};
+use adapters::{nix_destination, NixDeploymentBackend, SshTransport};
+use anyhow::{bail, Context, Result};
 use cattix_nix::Nix;
 use cattix_transport::OpenSsh;
 use std::{fmt, time::Duration};
@@ -32,6 +32,20 @@ impl FleetService {
 
     pub fn active_system_closure(&self, host: &Host) -> Result<SystemClosure> {
         rollout::active_system_closure(&SshTransport { ssh: &self.ssh }, host)
+    }
+
+    pub fn build_expected_host(
+        &self,
+        flake: &FlakeRef,
+        host_name: &HostName,
+        impure: bool,
+    ) -> Result<SystemClosure> {
+        let path =
+            self.nix
+                .build_host_with_logs(flake.as_str(), host_name.as_str(), impure, |line| {
+                    tracing::info!(host = %host_name, %line, "building expected system");
+                })?;
+        Ok(SystemClosure::new(path))
     }
 
     pub fn system_closure_diff(&self, host: &Host) -> Result<SystemClosureDiff> {
@@ -71,7 +85,13 @@ impl FleetService {
             .collect()
     }
 
-    pub fn diff(&self, fleet: &Fleet, scope: DeploymentScope<'_>) -> Result<Vec<HostDiff>> {
+    pub fn diff(
+        &self,
+        fleet: &Fleet,
+        scope: DeploymentScope<'_>,
+        flake: &FlakeRef,
+        impure: bool,
+    ) -> Result<Vec<HostDiff>> {
         fleet
             .selected_hosts(scope)?
             .map(|host| {
@@ -79,6 +99,23 @@ impl FleetService {
                 let report = diff
                     .has_changes()
                     .then(|| {
+                        let built_desired = self.build_expected_host(flake, &host.name, impure)?;
+                        if built_desired != diff.desired_system_closure {
+                            bail!(
+                                "flake evaluation expected {}, but building {} produced {}",
+                                diff.desired_system_closure,
+                                host.name,
+                                built_desired
+                            );
+                        }
+                        self.nix
+                            .copy_from(diff.active_system_closure.as_str(), &nix_destination(host)?)
+                            .with_context(|| {
+                                format!(
+                                    "copying active closure {} from {} into the local Nix store",
+                                    diff.active_system_closure, host.name
+                                )
+                            })?;
                         self.nix.nvd_diff(
                             diff.active_system_closure.as_str(),
                             diff.desired_system_closure.as_str(),
@@ -170,6 +207,7 @@ impl FleetService {
 #[derive(Debug, Clone, Copy)]
 pub struct DeploymentOptions {
     pub active_closure_timeout: Duration,
+    pub force: bool,
 }
 
 impl Default for DeploymentOptions {
@@ -178,6 +216,7 @@ impl Default for DeploymentOptions {
             // Large NixOS services, including GitLab, can take several minutes to
             // restart and reconnect. Operators can make this larger from the CLI.
             active_closure_timeout: Duration::from_secs(20 * 60),
+            force: false,
         }
     }
 }

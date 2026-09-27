@@ -304,6 +304,23 @@ pkgs.testers.runNixOSTest {
         "mkdir -p /tmp/cattix-test && cp /etc/cattix-test-flake.nix /tmp/cattix-test/flake.nix"
     )
 
+    before_dry_run = controller.succeed("ssh app-standby readlink /run/current-system").strip()
+    dry_run = json.loads(controller.succeed(
+        "cattix --flake /tmp/cattix-test --impure --json deploy --dry-run --host app-standby"
+    ))
+    assert dry_run["dry_run"] is True
+    assert len(dry_run["hosts"]) == 1
+    assert dry_run["hosts"][0]["would_deploy"] is True
+    assert dry_run["hosts"][0]["deployed"] == before_dry_run
+    assert controller.succeed("ssh app-standby readlink /run/current-system").strip() == before_dry_run
+
+    diff = json.loads(controller.succeed(
+        "cattix --flake /tmp/cattix-test --impure --json diff --host app-standby"
+    ))
+    assert diff["host"] == "app-standby"
+    assert diff["deployed"] != diff["expected"]
+    assert diff["report"]
+
     plan = json.loads(controller.succeed(
         "cattix --flake /tmp/cattix-test --impure --json plan --group app"
     ))

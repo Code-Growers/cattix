@@ -199,9 +199,9 @@ probe's error in both the live step tree and structured event output before Catt
 ```
 cattix groups                  # list rollout groups and their hosts
 cattix status [--host h | --group g] # per host: in sync / drifted / unreachable
-cattix diff [--host h | --group g]   # nvd diff of deployed vs git (packages, versions, services)
+cattix diff [--host h | --group g]   # build/copy closures as needed, then nvd diff (packages, versions, services)
 cattix plan [--host h | --group g]   # show the rollout order and steps without running them
-cattix deploy [--group g | --host h] [--active-closure-timeout 45m]
+cattix deploy [--group g | --host h] [--dry-run] [--force] [--active-closure-timeout 45m]
                                       # build → copy → switch → checks → rollback on check failure
 cattix rollback --host h [--active-closure-timeout 45m]
                                       # activate and health-check the Cattix-saved previous generation
@@ -217,9 +217,17 @@ Every command also supports `--json` output for CI. `deploy` and `rollback` defa
 fsync'd JSONL run record under `$XDG_STATE_HOME/cattix/runs` (or
 `~/.local/state/cattix/runs`); use `--report-dir DIR` to choose another location.
 
+`deploy --dry-run` builds and compares selected host closures, then reports which hosts would
+change without locking or modifying managed hosts. Nix may build and import paths in the
+controller's local store; use `plan` for a lightweight ordering-only preview. Add `--force` to
+preview all selected hosts as deployments, even when their closure paths match. A normal
+`deploy --force` bypasses the no-change skip and runs build, lock, copy, activation, and health
+checks for every selected host.
+
 Interactive deployments render a retained tree on stderr. Each host contains its deployment
 steps, and build/copy/check output remains directly below the step that produced it. Piped output
-and `--json` use structured tracing events instead.
+and `--json` use structured tracing events instead. In interactive mode, the rolling log window is
+limited to one third of the terminal height and keeps the latest lines; older output is summarized.
 
 The local QEMU fixture may use `--impure` to reference pre-built test store paths; normal flake evaluation remains pure by default.
 
@@ -259,7 +267,7 @@ The environment supplies a test-only SSH key to both Cattix and `nix copy`; stop
 
 Each selected host deploys one at a time, in group/name/order sort order.
 
-- **Diff first:** each selected host's deployed and expected build paths are compared. Hosts already in sync are skipped; `cattix diff` remains the detailed `nvd` report.
+- **Diff first:** each selected host's deployed and expected build paths are compared. Hosts already in sync are skipped; `cattix diff` builds the expected closure and copies the active closure from the target as needed before producing the detailed `nvd` report.
 
 ```
 pending → building → locking → copying → activating → checking → done

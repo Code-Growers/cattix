@@ -162,6 +162,28 @@ impl Nix {
         Ok(())
     }
 
+    pub fn copy_from(&self, build: &str, source: &str) -> Result<()> {
+        // The SSH store is the authenticated source of truth for this active
+        // closure. Remote system paths are not necessarily signed with a key
+        // trusted by the controller, so accept this explicitly selected
+        // source rather than rejecting otherwise valid store paths.
+        let command = format!("nix copy --no-check-sigs --from {source} {build}");
+        let output = Command::new("nix")
+            .args(["copy", "--no-check-sigs", "--from", source, build])
+            .output()
+            .with_context(|| format!("failed to start {command}"))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "{command} failed with status {}: stdout: {}; stderr: {}",
+                output.status.code().unwrap_or(255),
+                command_stderr(&output.stdout),
+                command_stderr(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
     /// Copies the packaged target probe runner closure and returns its target path.
     pub fn copy_probe_runner(
         &self,
