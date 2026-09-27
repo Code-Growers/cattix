@@ -7,10 +7,8 @@ use cattix_core::{
 };
 use clap::{Args, Parser, Subcommand};
 use console::Term;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use run_record::{RecordingReporter, RunRecorder};
 use std::{
-    collections::{HashMap, VecDeque},
     io::{IsTerminal, Write},
     path::PathBuf,
     time::Duration,
@@ -465,173 +463,43 @@ impl DeploymentReporter for TracingReporter {
 }
 
 struct TerminalReporter {
-    progress: MultiProgress,
-    hosts: HashMap<String, HostTree>,
-    steps: HashMap<(String, DeployStep), ProgressBar>,
     max_log_lines: usize,
-    visible_log_lines: VecDeque<ProgressBar>,
-    suppressed_log_lines: usize,
-    log_summary: Option<ProgressBar>,
-}
-
-struct HostTree {
-    tail: ProgressBar,
+    shown_log_lines: usize,
+    suppression_reported: bool,
 }
 
 impl TerminalReporter {
     fn new() -> Self {
         let rows = Term::stderr().size().0 as usize;
         Self {
-            // Limit terminal refreshes so bursty child-process output can't
-            // make the retained progress tree flicker.
-            progress: MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8)),
-            hosts: HashMap::new(),
-            steps: HashMap::new(),
             max_log_lines: terminal_log_height(rows),
-            visible_log_lines: VecDeque::new(),
-            suppressed_log_lines: 0,
-            log_summary: None,
+            shown_log_lines: 0,
+            suppression_reported: false,
         }
-    }
-
-    fn host_tail(&mut self, host: &str) -> ProgressBar {
-        if let Some(tree) = self.hosts.get(host) {
-            return tree.tail.clone();
-        }
-
-        let bar = self.progress.add(ProgressBar::new_spinner());
-        bar.set_style(ProgressStyle::with_template("▾ {msg}").expect("valid host template"));
-        bar.finish_with_message(host.to_owned());
-        self.hosts
-            .insert(host.to_owned(), HostTree { tail: bar.clone() });
-        bar
-    }
-
-    fn append(&mut self, host: &str, bar: ProgressBar) {
-        self.hosts
-            .get_mut(host)
-            .expect("host tree is created before appending rows")
-            .tail = bar;
-    }
-
-    fn step(&mut self, host: &str, step: DeployStep) -> ProgressBar {
-        let key = (host.to_owned(), step);
-        if let Some(bar) = self.steps.get(&key) {
-            return bar.clone();
-        }
-
-        let tail = self.host_tail(host);
-        let bar = self
-            .progress
-            .insert_after(&tail, ProgressBar::new_spinner());
-        bar.set_prefix(step.to_string());
-        self.steps.insert(key, bar.clone());
-        self.append(host, bar.clone());
-        bar
     }
 
     fn log(&mut self, host: &str, step: DeployStep, message: &str) {
-        self.step(host, step);
-
-        for message in message.lines().filter(|line| !line.is_empty()) {
-            if self.log_summary.is_some() {
-                if self.max_log_lines > 1 {
-                    self.hide_oldest_log_line();
-                    self.add_log_line(host, step, message);
-                } else {
-                    self.suppressed_log_lines += 1;
-                }
-                self.update_log_summary();
-                continue;
-            }
-
-            if self.visible_log_lines.len() < self.max_log_lines {
-                self.add_log_line(host, step, message);
-            } else if self.max_log_lines == 1 {
-                self.hide_oldest_log_line();
-                self.suppressed_log_lines += 1;
-                self.create_log_summary();
-            } else {
-                while self.visible_log_lines.len() > self.max_log_lines - 2 {
-                    self.hide_oldest_log_line();
-                }
-                self.add_log_line(host, step, message);
-                self.create_log_summary();
+        for line in message.lines().filter(|line| !line.is_empty()) {
+            // Reserve the final row for one stable notice that more output was
+            // omitted; unlike a live window, append-only output never redraws.
+            if self.shown_log_lines < self.max_log_lines.saturating_sub(1) {
+                eprintln!("  │ {host} {step}: {line}");
+                self.shown_log_lines += 1;
+            } else if !self.suppression_reported {
+                eprintln!("  │ … further build/deployment logs hidden (limit: one third of terminal height)");
+                self.suppression_reported = true;
             }
         }
-    }
-
-    fn add_log_line(&mut self, host: &str, step: DeployStep, message: &str) {
-        let line = self.progress.add(ProgressBar::new_spinner());
-        line.set_style(Self::log_style());
-        line.finish_with_message(format!("{host} {step}: {message}"));
-        self.visible_log_lines.push_back(line);
-    }
-
-    fn hide_oldest_log_line(&mut self) {
-        if let Some(oldest) = self.visible_log_lines.pop_front() {
-            self.progress.remove(&oldest);
-            self.suppressed_log_lines += 1;
-        }
-    }
-
-    fn create_log_summary(&mut self) {
-        let summary = self.progress.add(ProgressBar::new(1));
-        summary.set_style(Self::log_style());
-        self.log_summary = Some(summary);
-        self.update_log_summary();
-    }
-
-    fn update_log_summary(&self) {
-        if let Some(summary) = &self.log_summary {
-            summary.set_message(format!(
-                "… {} earlier log lines hidden (showing latest output)",
-                self.suppressed_log_lines
-            ));
-        }
-    }
-
-    fn running_style() -> ProgressStyle {
-        ProgressStyle::with_template("  {spinner:.cyan} {prefix} {msg}")
-            .expect("valid running-step template")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-    }
-
-    fn done_style() -> ProgressStyle {
-        ProgressStyle::with_template("  ✔ {prefix} {msg}").expect("valid done-step template")
-    }
-
-    fn failed_style() -> ProgressStyle {
-        ProgressStyle::with_template("  ✘ {prefix} {msg}").expect("valid failed-step template")
-    }
-
-    fn log_style() -> ProgressStyle {
-        ProgressStyle::with_template("  │   {msg}").expect("valid log template")
     }
 }
 
 impl DeploymentReporter for TerminalReporter {
     fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match event {
-            DeployEvent::Started { step } => {
-                let bar = self.step(host, step);
-                bar.set_style(Self::running_style());
-                bar.set_message("running");
-                bar.enable_steady_tick(std::time::Duration::from_millis(100));
-            }
-            DeployEvent::Log { step, message } => {
-                self.log(host, step, &message);
-            }
-            DeployEvent::Done { step, detail } => {
-                let bar = self.step(host, step);
-                bar.set_style(Self::done_style());
-                bar.finish_with_message(detail);
-            }
-            DeployEvent::Failed { step, error } => {
-                let bar = self.step(host, step);
-                bar.set_style(Self::failed_style());
-                bar.finish_with_message(error);
-            }
+            DeployEvent::Started { step } => eprintln!("→ {host} {step}: running"),
+            DeployEvent::Log { step, message } => self.log(host, step, &message),
+            DeployEvent::Done { step, detail } => eprintln!("✔ {host} {step}: {detail}"),
+            DeployEvent::Failed { step, error } => eprintln!("✘ {host} {step}: {error}"),
         }
         Ok(())
     }
@@ -753,7 +621,6 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
 mod tests {
     use super::{terminal_log_height, Cli, Command, DeployStep, TerminalReporter};
     use clap::Parser;
-    use indicatif::{MultiProgress, ProgressDrawTarget};
 
     #[test]
     fn terminal_log_window_uses_one_third_of_the_screen() {
@@ -763,9 +630,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_logs_are_bounded_and_keep_the_latest_lines() {
+    fn terminal_logs_are_bounded_with_one_suppression_notice() {
         let mut reporter = TerminalReporter::new();
-        reporter.progress = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         reporter.max_log_lines = 4;
 
         reporter.log(
@@ -774,9 +640,8 @@ mod tests {
             "one\ntwo\nthree\nfour\nfive\nsix\nseven",
         );
 
-        assert_eq!(reporter.visible_log_lines.len(), 3);
-        assert_eq!(reporter.suppressed_log_lines, 4);
-        assert!(reporter.log_summary.is_some());
+        assert_eq!(reporter.shown_log_lines, 3);
+        assert!(reporter.suppression_reported);
     }
 
     #[test]

@@ -224,10 +224,9 @@ preview all selected hosts as deployments, even when their closure paths match. 
 `deploy --force` bypasses the no-change skip and runs build, lock, copy, activation, and health
 checks for every selected host.
 
-Interactive deployments render a retained tree on stderr. Each host contains its deployment
-steps, and build/copy/check output remains directly below the step that produced it. Piped output
-and `--json` use structured tracing events instead. In interactive mode, the rolling log window is
-limited to one third of the terminal height and keeps the latest lines; older output is summarized.
+Interactive deployments print static step events to stderr without animated loaders or screen
+redraws. Raw build/copy/check logs are capped at one third of terminal height; additional lines are
+suppressed with one notice. Piped output and `--json` keep the complete structured event stream.
 
 The local QEMU fixture may use `--impure` to reference pre-built test store paths; normal flake evaluation remains pure by default.
 

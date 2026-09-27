@@ -194,9 +194,9 @@ cattix --flake . rollback --host gitlab-standby
 | `rollback --host HOST` | Activate and health-check the closure saved before the most recent Cattix activation on that host. |
 | `update`, `scan`, `inventory`, `serve` | Reserved CLI commands; not implemented yet. |
 
-`--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments render a retained tree on stderr. JSON output and piped event output are structured for automation.
+`--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments print static step events to stderr without animated loaders or screen redraws. JSON output and piped event output are structured for automation.
 
-In interactive mode, the rolling build/deployment log window is limited to one third of the terminal height and retains the latest output; older lines are summarized. JSON and piped output are not truncated.
+In interactive mode, raw build/deployment logs are capped at one third of terminal height; additional lines are suppressed with one notice. JSON and piped output are not truncated.
 
 ## Deployment behavior
 
