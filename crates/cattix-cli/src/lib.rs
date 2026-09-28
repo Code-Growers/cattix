@@ -6,7 +6,7 @@ use cattix_core::{
     Fleet, FleetService, GroupName, HostDiff, HostName, SystemClosure,
 };
 use clap::{Args, Parser, Subcommand};
-use console::Term;
+use console::{Style, Term};
 use run_record::{RecordingReporter, RunRecorder};
 use std::{
     io::{IsTerminal, Write},
@@ -483,12 +483,59 @@ impl TerminalReporter {
             // Reserve the final row for one stable notice that more output was
             // omitted; unlike a live window, append-only output never redraws.
             if self.shown_log_lines < self.max_log_lines.saturating_sub(1) {
-                eprintln!("  │ {host} {step}: {line}");
+                let prefix = Style::new()
+                    .for_stderr()
+                    .dim()
+                    .apply_to(format!("  │ [{host} · {}]", step.as_str()));
+                eprintln!("{prefix} {line}");
                 self.shown_log_lines += 1;
             } else if !self.suppression_reported {
-                eprintln!("  │ … further build/deployment logs hidden (limit: one third of terminal height)");
+                let notice = Style::new()
+                    .for_stderr()
+                    .yellow()
+                    .apply_to("  │ … further build/deployment logs hidden (limit: one third of terminal height)");
+                eprintln!("{notice}");
                 self.suppression_reported = true;
             }
+        }
+    }
+
+    fn operation(step: DeployStep) -> &'static str {
+        match step {
+            DeployStep::Diffing => "Compare active and desired system closures",
+            DeployStep::Building => "Build the desired NixOS system",
+            DeployStep::Locking => "Acquire the deployment lock",
+            DeployStep::Copying => "Copy the system closure to the target",
+            DeployStep::Activating => "Activate the new NixOS generation",
+            DeployStep::Checking => "Wait for activation and run health checks",
+            DeployStep::Finalizing => "Finalize the deployment",
+            DeployStep::Deploy => "Deploy the host",
+            DeployStep::RollingBack => "Restore the previous NixOS generation",
+            DeployStep::VerifyingRollback => "Verify rollback and health checks",
+        }
+    }
+
+    fn completion(step: DeployStep, detail: &str) -> String {
+        match (step, detail) {
+            (DeployStep::Diffing, "changes detected") => {
+                "Active and desired closures differ".into()
+            }
+            (DeployStep::Diffing, "no changes; skipping deployment") => {
+                "Closures match; host skipped".into()
+            }
+            (DeployStep::Diffing, "no changes; forced deployment") => {
+                "Closures match; forced deployment will continue".into()
+            }
+            (DeployStep::Building, _) => format!("System build complete: {detail}"),
+            (DeployStep::Locking, _) => "Deployment lock acquired".into(),
+            (DeployStep::Copying, _) => format!("System copy complete: {detail}"),
+            (DeployStep::Activating, _) => format!("Activation confirmed: {detail}"),
+            (DeployStep::Checking, _) => "Activation and health checks passed".into(),
+            (DeployStep::Finalizing, _) => "Host is healthy and ready".into(),
+            (DeployStep::RollingBack, _) => format!("Rollback command complete: {detail}"),
+            (DeployStep::VerifyingRollback, _) => "Rollback and health checks passed".into(),
+            (DeployStep::Deploy, _) => format!("Deployment complete: {detail}"),
+            (DeployStep::Diffing, _) => format!("Closure comparison complete: {detail}"),
         }
     }
 }
@@ -496,10 +543,25 @@ impl TerminalReporter {
 impl DeploymentReporter for TerminalReporter {
     fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match event {
-            DeployEvent::Started { step } => eprintln!("→ {host} {step}: running"),
+            DeployEvent::Started { step } => {
+                let marker = Style::new().for_stderr().cyan().bold().apply_to("→");
+                let host = Style::new().for_stderr().bold().apply_to(host);
+                eprintln!("{marker} {host} {}", Self::operation(step));
+            }
             DeployEvent::Log { step, message } => self.log(host, step, &message),
-            DeployEvent::Done { step, detail } => eprintln!("✔ {host} {step}: {detail}"),
-            DeployEvent::Failed { step, error } => eprintln!("✘ {host} {step}: {error}"),
+            DeployEvent::Done { step, detail } => {
+                let marker = Style::new().for_stderr().green().bold().apply_to("✔");
+                let host = Style::new().for_stderr().bold().apply_to(host);
+                eprintln!("{marker} {host} {}", Self::completion(step, &detail));
+            }
+            DeployEvent::Failed { step, error } => {
+                let marker = Style::new().for_stderr().red().bold().apply_to("✘");
+                let host = Style::new().for_stderr().bold().apply_to(host);
+                eprintln!(
+                    "{marker} {host} Failed while {}: {error}",
+                    Self::operation(step)
+                );
+            }
         }
         Ok(())
     }

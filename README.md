@@ -224,9 +224,12 @@ preview all selected hosts as deployments, even when their closure paths match. 
 `deploy --force` bypasses the no-change skip and runs build, lock, copy, activation, and health
 checks for every selected host.
 
-Interactive deployments print static step events to stderr without animated loaders or screen
-redraws. Raw build/copy/check logs are capped at one third of terminal height; additional lines are
-suppressed with one notice. Piped output and `--json` keep the complete structured event stream.
+Interactive deployments print static, colored step events to stderr without animated loaders or
+screen redraws. Each step names its operation (for example, acquiring the deployment lock or
+activating the NixOS generation); completions and failures are marked separately. Colors follow
+terminal settings such as `NO_COLOR`. Raw build/copy/check logs are capped at one third of terminal
+height; additional lines are suppressed with one notice. Piped output and `--json` keep the
+complete structured event stream.
 
 The local QEMU fixture may use `--impure` to reference pre-built test store paths; normal flake evaluation remains pure by default.
 
