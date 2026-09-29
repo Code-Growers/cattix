@@ -18,7 +18,8 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
-console = "0.16.6"
+iocraft = "0.9.1"
+smol = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

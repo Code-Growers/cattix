@@ -1,3 +1,4 @@
+mod deploy_tui;
 mod run_record;
 
 use anyhow::{bail, Context, Result};
@@ -6,7 +7,7 @@ use cattix_core::{
     Fleet, FleetService, GroupName, HostDiff, HostName, SystemClosure,
 };
 use clap::{Args, Parser, Subcommand};
-use console::{Style, Term};
+use deploy_tui::{DeploymentTui, StatusColor};
 use run_record::{RecordingReporter, RunRecorder};
 use std::{
     io::{IsTerminal, Write},
@@ -462,42 +463,20 @@ impl DeploymentReporter for TracingReporter {
     }
 }
 
-struct TerminalReporter {
-    max_log_lines: usize,
-    shown_log_lines: usize,
-    suppression_reported: bool,
-}
+struct TerminalReporter(DeploymentTui);
 
 impl TerminalReporter {
-    fn new() -> Self {
-        let rows = Term::stderr().size().0 as usize;
-        Self {
-            max_log_lines: terminal_log_height(rows),
-            shown_log_lines: 0,
-            suppression_reported: false,
-        }
+    fn new() -> std::io::Result<Self> {
+        DeploymentTui::start().map(Self)
     }
 
-    fn log(&mut self, host: &str, step: DeployStep, message: &str) {
-        for line in message.lines().filter(|line| !line.is_empty()) {
-            // Reserve the final row for one stable notice that more output was
-            // omitted; unlike a live window, append-only output never redraws.
-            if self.shown_log_lines < self.max_log_lines.saturating_sub(1) {
-                let prefix = Style::new()
-                    .for_stderr()
-                    .dim()
-                    .apply_to(format!("  │ [{host} · {}]", step.as_str()));
-                eprintln!("{prefix} {line}");
-                self.shown_log_lines += 1;
-            } else if !self.suppression_reported {
-                let notice = Style::new()
-                    .for_stderr()
-                    .yellow()
-                    .apply_to("  │ … further build/deployment logs hidden (limit: one third of terminal height)");
-                eprintln!("{notice}");
-                self.suppression_reported = true;
-            }
-        }
+    fn log(&self, host: &str, step: DeployStep, message: &str) -> std::io::Result<()> {
+        let lines = message
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("  │ [{host} · {}] {line}", step.as_str()))
+            .collect();
+        self.0.logs(lines)
     }
 
     fn operation(step: DeployStep) -> &'static str {
@@ -544,23 +523,23 @@ impl DeploymentReporter for TerminalReporter {
     fn emit(&mut self, host: &str, event: DeployEvent) -> Result<()> {
         match event {
             DeployEvent::Started { step } => {
-                let marker = Style::new().for_stderr().cyan().bold().apply_to("→");
-                let host = Style::new().for_stderr().bold().apply_to(host);
-                eprintln!("{marker} {host} {}", Self::operation(step));
+                self.0.status(
+                    StatusColor::Cyan,
+                    format!("→ {host} {}", Self::operation(step)),
+                )?;
             }
-            DeployEvent::Log { step, message } => self.log(host, step, &message),
+            DeployEvent::Log { step, message } => self.log(host, step, &message)?,
             DeployEvent::Done { step, detail } => {
-                let marker = Style::new().for_stderr().green().bold().apply_to("✔");
-                let host = Style::new().for_stderr().bold().apply_to(host);
-                eprintln!("{marker} {host} {}", Self::completion(step, &detail));
+                self.0.status(
+                    StatusColor::Green,
+                    format!("✔ {host} {}", Self::completion(step, &detail)),
+                )?;
             }
             DeployEvent::Failed { step, error } => {
-                let marker = Style::new().for_stderr().red().bold().apply_to("✘");
-                let host = Style::new().for_stderr().bold().apply_to(host);
-                eprintln!(
-                    "{marker} {host} Failed while {}: {error}",
-                    Self::operation(step)
-                );
+                self.0.status(
+                    StatusColor::Red,
+                    format!("✘ {host} Failed while {}: {error}", Self::operation(step)),
+                )?;
             }
         }
         Ok(())
@@ -581,13 +560,15 @@ impl DeploymentReporter for CliReporter {
     }
 }
 
-fn terminal_log_height(rows: usize) -> usize {
-    (rows / 3).max(1)
-}
-
 fn deployment_reporter(json: bool) -> CliReporter {
-    if !json && std::io::stderr().is_terminal() {
-        CliReporter::Terminal(TerminalReporter::new())
+    if !json && std::io::stdout().is_terminal() {
+        match TerminalReporter::new() {
+            Ok(reporter) => CliReporter::Terminal(reporter),
+            Err(error) => {
+                tracing::warn!(%error, "could not start deployment TUI; using plain event output");
+                CliReporter::Tracing(TracingReporter)
+            }
+        }
     } else {
         CliReporter::Tracing(TracingReporter)
     }
@@ -681,30 +662,8 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{terminal_log_height, Cli, Command, DeployStep, TerminalReporter};
+    use super::{Cli, Command};
     use clap::Parser;
-
-    #[test]
-    fn terminal_log_window_uses_one_third_of_the_screen() {
-        assert_eq!(terminal_log_height(24), 8);
-        assert_eq!(terminal_log_height(60), 20);
-        assert_eq!(terminal_log_height(2), 1);
-    }
-
-    #[test]
-    fn terminal_logs_are_bounded_with_one_suppression_notice() {
-        let mut reporter = TerminalReporter::new();
-        reporter.max_log_lines = 4;
-
-        reporter.log(
-            "app",
-            DeployStep::Building,
-            "one\ntwo\nthree\nfour\nfive\nsix\nseven",
-        );
-
-        assert_eq!(reporter.shown_log_lines, 3);
-        assert!(reporter.suppression_reported);
-    }
 
     #[test]
     fn fleet_commands_share_host_and_group_selection() {

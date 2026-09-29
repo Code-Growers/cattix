@@ -7,8 +7,9 @@ edition = "2021"
 anyhow = { workspace = true }
 cattix-core = { path = "../cattix-core" }
 clap = { version = "4", features = ["derive"] }
-console = { workspace = true }
+iocraft = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+smol = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

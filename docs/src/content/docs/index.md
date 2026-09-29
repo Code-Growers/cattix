@@ -194,9 +194,7 @@ cattix --flake . rollback --host gitlab-standby
 | `rollback --host HOST` | Activate and health-check the closure saved before the most recent Cattix activation on that host. |
 | `update`, `scan`, `inventory`, `serve` | Reserved CLI commands; not implemented yet. |
 
-`--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments print static, colored step events to stderr without animated loaders or screen redraws. Step messages name the operation; completions and failures are visually distinct. Colors respect terminal settings such as `NO_COLOR`. JSON output and piped event output are structured for automation.
-
-In interactive mode, raw build/deployment logs are capped at one third of terminal height; additional lines are suppressed with one notice. JSON and piped output are not truncated.
+`--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments use a fixed terminal viewport: colored step updates stay above a one-third-height log pane, and the pane follows new build/copy/check lines by default. Use arrow keys, Page Up/Down, Home/End, or the mouse wheel to inspect earlier lines. Older lines move out of view without scrolling the terminal. The interactive screen is restored when the command exits. Colors respect terminal settings such as `NO_COLOR`. JSON output and piped event output retain the complete structured event stream.
 
 ## Deployment behavior
 
@@ -223,10 +221,10 @@ The `diff` command runs `nix build` for the expected host configuration so the d
 The repository provides a disposable two-VM environment:
 
 ```sh
-nix run .#cattix-vm-lab
+make vm-lab
 ```
 
-The first terminal prints a command to source a generated environment file. In a second terminal:
+The first terminal prints a command to source a generated environment file. In a second terminal, use the exact file path printed by the lab:
 
 ```sh
 source /tmp/cattix-vm-lab.*/environment
@@ -234,7 +232,7 @@ nix develop -c cargo run --bin cattix -- --flake "$CATTIX_VM_FLEET" --impure sta
 nix develop -c cargo run --bin cattix -- --flake "$CATTIX_VM_FLEET" --impure deploy --group app
 ```
 
-The lab provides a test-only SSH key to Cattix and `nix copy`. Stop the VM lab with Ctrl-C in its terminal when finished.
+The lab provides a test-only SSH key to Cattix and `nix copy`. Stop the VM lab with Ctrl-C in its terminal when finished. Run `make help` for all project, documentation, and VM-lab commands.
 
 ## Development
 
@@ -248,7 +246,7 @@ The repository is a Rust workspace. The main crates are:
 | `cattix-utils` | Shared value types and low-level helpers. |
 | `cattix-cli` | Clap CLI and terminal/JSON event rendering. |
 
-Enter the development environment with `nix develop`. Run the CLI from the repository with `cargo run --bin cattix -- --flake PATH COMMAND`. A plain Cargo run does not provide the packaged `cattix-probe-runner` needed for target-local network probes.
+Run `make help` for common project commands. Rust workflows include `make build`, `make test`, `make fmt`, and `make verify` (format check, tests, and Clippy). `make package` builds the Nix CLI package; `make flake-check` runs all Nix checks, including the longer NixOS integration test. Run the local CLI with `make run ARGS="--flake PATH COMMAND"`. A plain Cargo run does not provide the packaged `cattix-probe-runner` needed for target-local network probes.
 
 ## Roadmap and boundaries
 
@@ -260,4 +258,4 @@ Cattix focuses on fleet inspection and rollout. Use separate tools for machine p
 
 The documentation lives in `docs/`. Pull requests build the Starlight site; pushes to `main` build and publish it with GitHub Pages Actions. In repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. The configured project site URL is `https://code-growers.github.io/cattix/`; the plain Markdown endpoint is `https://code-growers.github.io/cattix/llms.txt`.
 
-To work on the docs locally, run `npm ci`, then `npm run dev` from `docs/`. `npm run build` creates the static site in `docs/dist/` and generates `docs/public/llms.txt` from this page.
+To work on the docs locally, run `make docs-install`, then `make docs-dev`. `make docs-build` creates the static site in `docs/dist/` and generates `docs/public/llms.txt` from this page.

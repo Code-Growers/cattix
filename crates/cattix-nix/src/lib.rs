@@ -227,6 +227,10 @@ fn exact_flake_attribute(flake: &str, attribute: &str) -> String {
     format!("{flake}#.{attribute}")
 }
 
+fn command_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).trim().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::exact_flake_attribute;
@@ -242,8 +246,4 @@ mod tests {
             "/tmp/fleet#.nixosConfigurations.host.config.system.build.toplevel"
         );
     }
-}
-
-fn command_stderr(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr).trim().to_owned()
 }

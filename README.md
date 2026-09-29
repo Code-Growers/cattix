@@ -224,12 +224,12 @@ preview all selected hosts as deployments, even when their closure paths match. 
 `deploy --force` bypasses the no-change skip and runs build, lock, copy, activation, and health
 checks for every selected host.
 
-Interactive deployments print static, colored step events to stderr without animated loaders or
-screen redraws. Each step names its operation (for example, acquiring the deployment lock or
-activating the NixOS generation); completions and failures are marked separately. Colors follow
-terminal settings such as `NO_COLOR`. Raw build/copy/check logs are capped at one third of terminal
-height; additional lines are suppressed with one notice. Piped output and `--json` keep the
-complete structured event stream.
+Interactive deployments use a fixed terminal viewport: colored step updates stay above a
+one-third-height log pane, and the pane scrolls internally as new build/copy/check lines arrive.
+The pane follows new output by default; use arrow keys, Page Up/Down, Home/End, or the mouse wheel
+to inspect earlier lines. Older lines move out of view without scrolling the terminal. The
+interactive screen is restored when the command exits. Colors follow terminal settings such as
+`NO_COLOR`; piped output and `--json` keep the complete structured event stream.
 
 The local QEMU fixture may use `--impure` to reference pre-built test store paths; normal flake evaluation remains pure by default.
 
@@ -238,19 +238,25 @@ The local QEMU fixture may use `--impure` to reference pre-built test store path
 Run two local QEMU targets in one terminal:
 
 ```sh
-nix run .#cattix-vm-lab
+make vm-lab
 ```
 
-It prints a `source` command for a generated environment file. In a second terminal, source it and run the local CLI against the two VMs:
+The first terminal prints a `source` command for a generated environment file. In a second terminal, pass the exact path printed by the lab to these targets:
 
 ```sh
-source /tmp/cattix-vm-lab.*/environment
-nix develop -c cargo run --bin cattix -- --flake "$CATTIX_VM_FLEET" --impure status
-nix develop -c cargo run --bin cattix -- --flake "$CATTIX_VM_FLEET" --impure deploy --group app
-nix develop -c cargo run --bin cattix -- --flake "$CATTIX_VM_FLEET" --impure deploy --host app-standby
+make lab-status LAB_ENV=/tmp/cattix-vm-lab.XXXXXX/environment
+make lab-plan LAB_ENV=/tmp/cattix-vm-lab.XXXXXX/environment
+make lab-deploy LAB_ENV=/tmp/cattix-vm-lab.XXXXXX/environment
+make lab-deploy-standby LAB_ENV=/tmp/cattix-vm-lab.XXXXXX/environment
 ```
 
-The environment supplies a test-only SSH key to both Cattix and `nix copy`; stop the first terminal with Ctrl-C when finished.
+The environment supplies a test-only SSH key to both Cattix and `nix copy`; stop the first terminal with Ctrl-C when finished. Run `make help` for the other project, docs, and lab commands.
+
+## Development
+
+Run `make help` for the available project commands. Common Rust workflows are `make dev`, `make build`, `make test`, `make fmt`, and `make verify` (format check, workspace tests, and Clippy). Build the Nix package with `make package`; `make flake-check` also runs the NixOS integration test and may take longer. `make run ARGS="--flake PATH COMMAND"` runs the local CLI. A plain Cargo run does not provide the packaged `cattix-probe-runner` needed for target-local network probes.
+
+For the Starlight docs, run `make docs-install` once, then `make docs-dev`; use `make docs-build` to build the site and generate `/llms.txt`.
 
 ## Features
 
