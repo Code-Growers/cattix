@@ -98,6 +98,12 @@ enum Command {
     Scan {
         #[command(flatten)]
         scope: FleetScope,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Parent directory for generated SBOM and vulnerability artifacts"
+        )]
+        output_dir: Option<PathBuf>,
     },
     Inventory {
         #[command(flatten)]
@@ -173,10 +179,16 @@ fn execute(cli: Cli) -> Result<()> {
                 force: false,
             },
         ),
-        Command::Update { .. }
-        | Command::Scan { .. }
-        | Command::Inventory { .. }
-        | Command::Serve => bail!("this command is not implemented yet"),
+        Command::Scan { scope, output_dir } => scan(
+            &cli.flake,
+            scope,
+            cli.json,
+            cli.impure,
+            output_dir.as_deref(),
+        ),
+        Command::Update { .. } | Command::Inventory { .. } | Command::Serve => {
+            bail!("this command is not implemented yet")
+        }
     }
 }
 
@@ -191,7 +203,7 @@ fn init_logging(json: bool) {
             .flatten_event(true)
             .with_target(false)
             .with_ansi(false)
-            .with_writer(std::io::stdout)
+            .with_writer(std::io::stderr)
             .init();
     } else {
         tracing_subscriber::fmt()
@@ -236,6 +248,72 @@ fn groups(flake: &str, json: bool, impure: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn scan(
+    flake: &str,
+    selection: FleetScope,
+    json: bool,
+    impure: bool,
+    output_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let fleet = load_fleet_config(flake, impure)?;
+    let host_name = selection.host.as_deref().map(HostName::from);
+    let group = selection.group.as_deref().map(GroupName::from);
+
+    let base_dir = output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_scan_dir);
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_nanos();
+    let run_dir = base_dir.join(format!("{run_id}-{}", std::process::id()));
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("creating scan directory {}", run_dir.display()))?;
+
+    let reports = FleetService::default().scan(
+        &fleet,
+        deployment_scope(host_name.as_ref(), group.as_ref()),
+        &FlakeRef::from(flake),
+        impure,
+        &run_dir,
+    )?;
+    let manifest = run_dir.join("report.json");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&reports)?)
+        .with_context(|| format!("writing scan manifest {}", manifest.display()))?;
+
+    if json {
+        write_json(&serde_json::json!({
+            "report": manifest,
+            "hosts": reports,
+        }))?;
+    } else if reports.is_empty() {
+        tracing::info!(directory = %run_dir.display(), "no hosts matched");
+    } else {
+        for report in &reports {
+            tracing::info!(
+                host = %report.host,
+                active_closure = %report.active_system_closure,
+                desired_closure = %report.desired_system_closure,
+                active_artifacts = %report.active.directory.display(),
+                desired_artifacts = %report.desired.directory.display(),
+                "vulnerability scan complete"
+            );
+        }
+        tracing::info!(report = %manifest.display(), "scan report manifest");
+    }
+    Ok(())
+}
+
+fn default_scan_dir() -> PathBuf {
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("cattix/scans");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/state/cattix/scans");
+    }
+    PathBuf::from(".cattix/scans")
 }
 
 fn status(flake: &str, selection: FleetScope, json: bool, impure: bool) -> Result<()> {

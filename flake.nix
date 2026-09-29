@@ -11,6 +11,11 @@
     crane = {
       url = "github:ipetkov/crane";
     };
+
+    sbomnix = {
+      url = "github:wexder/sbomnix/vulnxscan-impure";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -50,6 +55,9 @@
           openssl_pkgs = pkgs.openssl;
           fenixSys = fenix.packages.${system};
           craneLib = (crane.mkLib pkgs).overrideToolchain fenixSys.minimal.toolchain;
+          vulnxscan = pkgs.writeShellScriptBin "vulnxscan" ''
+            exec ${inputs.sbomnix.apps.${system}.vulnxscan.program} "$@"
+          '';
           package = craneLib.buildPackage {
             pname = "cattix";
             version = "0.1.0";
@@ -64,7 +72,12 @@
             buildInputs = [ openssl_pkgs.dev ];
             postInstall = ''
               wrapProgram $out/bin/cattix \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix pkgs.nvd ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [
+                  pkgs.nix
+                  pkgs.nvd
+                  inputs.sbomnix.packages.${system}.sbomnix
+                  vulnxscan
+                ]}
             '';
             cargoBuildCommand = "cargo build --profile release --bins";
             cargoInstallCommand = "cargo install --path . --root $out --bins";
@@ -107,6 +120,8 @@
               pkgs.clang
               pkgs.sccache
               pkgs.nvd
+              inputs.sbomnix.packages.${system}.sbomnix
+              vulnxscan
               pkgs.nodejs
 
               (fenixSys.complete.withComponents [

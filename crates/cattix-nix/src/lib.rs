@@ -2,8 +2,9 @@
 
 use std::{
     io::{BufRead, BufReader, Read},
+    path::Path,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::mpsc::{self, Sender},
     thread,
 };
 
@@ -13,6 +14,55 @@ use anyhow::{anyhow, bail, Context, Result};
 pub struct Nix;
 
 impl Nix {
+    /// Generate CycloneDX and SPDX SBOMs for a flake reference or store path.
+    pub fn generate_sbom(&self, target: &str, impure: bool, output_dir: &Path) -> Result<()> {
+        run_tool("sbomnix", [target], impure, output_dir)
+            .with_context(|| format!("generating SBOM for {target}"))?;
+        for artifact in ["sbom.cdx.json", "sbom.spdx.json", "sbom.csv"] {
+            if !output_dir.join(artifact).is_file() {
+                bail!(
+                    "sbomnix completed without writing {}",
+                    output_dir.join(artifact).display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run sbomnix's full vulnerability scan and preserve its SARIF and evidence reports.
+    pub fn scan_vulnerabilities(
+        &self,
+        target: &str,
+        impure: bool,
+        output_dir: &Path,
+    ) -> Result<()> {
+        run_tool(
+            "vulnxscan",
+            [
+                target,
+                "--format",
+                "sarif",
+                "--out",
+                "vulns.sarif",
+                "--evidence-out",
+                "evidence.json",
+                "-v",
+            ],
+            impure,
+            output_dir,
+        )
+        .with_context(|| format!("scanning vulnerabilities for {target}"))?;
+        for artifact in ["vulns.sarif", "evidence.json"] {
+            if !output_dir.join(artifact).is_file() {
+                bail!(
+                    "vulnxscan completed without writing {}",
+                    output_dir.join(artifact).display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Evaluates a flake attribute and returns its JSON document unchanged.
     /// Interpretation of that document belongs to the calling application.
     pub fn eval_json(&self, flake: &str, attribute: &str, impure: bool) -> Result<Vec<u8>> {
@@ -221,6 +271,101 @@ impl Nix {
     }
 }
 
+fn run_tool<const N: usize>(
+    program: &str,
+    args: [&str; N],
+    impure: bool,
+    output_dir: &Path,
+) -> Result<()> {
+    tracing::info!(tool = program, "starting scan tool");
+    let mut command = Command::new(program);
+    command.args(tool_args(&args, impure));
+    let mut child = command
+        .current_dir(output_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("scan tool did not provide stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("scan tool did not provide stderr")?;
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = forward_output(stdout, false, sender.clone());
+    let stderr_reader = forward_output(stderr, true, sender.clone());
+    drop(sender);
+
+    let mut stdout_output = Vec::new();
+    let mut stderr_output = Vec::new();
+    for (is_stderr, bytes) in receiver {
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        tracing::info!(tool = program, %line, "sbomnix output");
+        if is_stderr {
+            stderr_output.extend_from_slice(&bytes);
+        } else {
+            stdout_output.extend_from_slice(&bytes);
+        }
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {program}"))?;
+    stdout_reader
+        .join()
+        .map_err(|_| anyhow!("{program} stdout reader panicked"))?
+        .with_context(|| format!("reading {program} stdout"))?;
+    stderr_reader
+        .join()
+        .map_err(|_| anyhow!("{program} stderr reader panicked"))?
+        .with_context(|| format!("reading {program} stderr"))?;
+
+    if !status.success() {
+        bail!(
+            "{program} failed with status {}: stdout: {}; stderr: {}",
+            status.code().unwrap_or(255),
+            command_stderr(&stdout_output),
+            command_stderr(&stderr_output)
+        );
+    }
+    tracing::info!(tool = program, "scan tool finished");
+    Ok(())
+}
+
+fn forward_output<R: Read + Send + 'static>(
+    reader: R,
+    is_stderr: bool,
+    sender: Sender<(bool, Vec<u8>)>,
+) -> thread::JoinHandle<std::io::Result<()>> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            sender
+                .send((is_stderr, line.clone()))
+                .map_err(|_| std::io::Error::other("scan output receiver closed"))?;
+        }
+        Ok(())
+    })
+}
+
+fn tool_args(args: &[&str], impure: bool) -> Vec<String> {
+    let mut args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    if impure {
+        args.push("--impure".to_owned());
+    }
+    args
+}
+
 /// Select a flake output attribute without Nix's package-prefix fallback.
 /// Fleet data such as `cattix` must remain distinct from installable packages.
 fn exact_flake_attribute(flake: &str, attribute: &str) -> String {
@@ -233,7 +378,7 @@ fn command_stderr(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::exact_flake_attribute;
+    use super::{exact_flake_attribute, tool_args};
 
     #[test]
     fn flake_attributes_are_selected_from_the_output_root() {
@@ -244,6 +389,15 @@ mod tests {
                 "nixosConfigurations.host.config.system.build.toplevel"
             ),
             "/tmp/fleet#.nixosConfigurations.host.config.system.build.toplevel"
+        );
+    }
+
+    #[test]
+    fn tool_args_forward_impure_only_when_requested() {
+        assert_eq!(tool_args(&[".#pkg"], false), vec![".#pkg".to_owned()]);
+        assert_eq!(
+            tool_args(&[".#pkg"], true),
+            vec![".#pkg".to_owned(), "--impure".to_owned()]
         );
     }
 }

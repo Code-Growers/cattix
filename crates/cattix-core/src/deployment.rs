@@ -8,7 +8,11 @@ use adapters::{nix_destination, NixDeploymentBackend, SshTransport};
 use anyhow::{bail, Context, Result};
 use cattix_nix::Nix;
 use cattix_transport::OpenSsh;
-use std::{fmt, time::Duration};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub use health::run_local_health_check;
 
@@ -61,6 +65,92 @@ impl FleetService {
             active_system_closure.as_str(),
             desired_system_closure.as_str(),
         )
+    }
+
+    pub fn scan(
+        &self,
+        fleet: &Fleet,
+        scope: DeploymentScope<'_>,
+        flake: &FlakeRef,
+        impure: bool,
+        output_dir: &Path,
+    ) -> Result<Vec<HostScan>> {
+        let mut reports = Vec::new();
+        for (index, host) in fleet.selected_hosts(scope)?.enumerate() {
+            let host_dir = output_dir.join(format!(
+                "{index:03}-{}",
+                safe_path_component(host.name.as_str())
+            ));
+            fs::create_dir_all(&host_dir).with_context(|| {
+                format!("creating scan output directory {}", host_dir.display())
+            })?;
+
+            let desired = self.build_expected_host(flake, &host.name, impure)?;
+            if desired != host.desired_system_closure {
+                bail!(
+                    "flake evaluation expected {}, but building {} produced {}",
+                    host.desired_system_closure,
+                    host.name,
+                    desired
+                );
+            }
+            let active = self.active_system_closure(host)?;
+            let desired_target = format!(
+                "{}#.nixosConfigurations.{}.config.system.build.toplevel",
+                flake, host.name
+            );
+            let desired_artifacts =
+                self.scan_closure(&desired, &desired_target, impure, &host_dir.join("desired"))?;
+
+            // We don't need to scen active it's it's the same as desired
+            let active_artifacts = if active == desired {
+                desired_artifacts.clone()
+            } else {
+                self.nix
+                    .copy_from(active.as_str(), &nix_destination(host)?)
+                    .with_context(|| {
+                        format!(
+                            "copying active closure {} from {} into the local Nix store",
+                            active, host.name
+                        )
+                    })?;
+                self.scan_closure(&active, active.as_str(), false, &host_dir.join("active"))?
+            };
+
+            reports.push(HostScan {
+                host: host.name.clone(),
+                active_system_closure: active,
+                desired_system_closure: desired,
+                active: active_artifacts,
+                desired: desired_artifacts,
+            });
+        }
+        Ok(reports)
+    }
+
+    fn scan_closure(
+        &self,
+        closure: &SystemClosure,
+        target: &str,
+        impure: bool,
+        output_dir: &Path,
+    ) -> Result<ScanArtifacts> {
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("creating scan output directory {}", output_dir.display()))?;
+        self.nix
+            .generate_sbom(target, impure, output_dir)
+            .with_context(|| format!("generating SBOM for {}", closure))?;
+        self.nix
+            .scan_vulnerabilities(target, impure, output_dir)
+            .with_context(|| format!("scanning {}", closure))?;
+        Ok(ScanArtifacts {
+            directory: output_dir.to_path_buf(),
+            cyclonedx_sbom: output_dir.join("sbom.cdx.json"),
+            spdx_sbom: output_dir.join("sbom.spdx.json"),
+            sbom_csv: output_dir.join("sbom.csv"),
+            vulnerabilities_sarif: output_dir.join("vulns.sarif"),
+            evidence_json: output_dir.join("evidence.json"),
+        })
     }
 
     pub fn status(&self, fleet: &Fleet, scope: DeploymentScope<'_>) -> Result<Vec<HostStatus>> {
@@ -377,6 +467,45 @@ pub struct HostDiff {
     pub deployed: SystemClosure,
     pub expected: SystemClosure,
     pub report: Option<String>,
+}
+
+/// SBOM and vulnerability artifacts for one system closure.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanArtifacts {
+    pub directory: PathBuf,
+    pub cyclonedx_sbom: PathBuf,
+    pub spdx_sbom: PathBuf,
+    pub sbom_csv: PathBuf,
+    pub vulnerabilities_sarif: PathBuf,
+    pub evidence_json: PathBuf,
+}
+
+/// Scan results and artifact paths for one host's active and desired closures.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HostScan {
+    pub host: HostName,
+    pub active_system_closure: SystemClosure,
+    pub desired_system_closure: SystemClosure,
+    pub active: ScanArtifacts,
+    pub desired: ScanArtifacts,
+}
+
+fn safe_path_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if component.is_empty() {
+        "host".into()
+    } else {
+        component
+    }
 }
 
 /// A host's position and actions in a rollout plan.

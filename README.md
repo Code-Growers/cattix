@@ -2,7 +2,7 @@
 
 Fleet management for NixOS hosts: inventory, drift detection, updates, vulnerability scanning and health-gated rolling deployments, driven from a Nix flake.
 
-> Status: the CLI MVP is ready for dogfooding: ordered SSH deployments, health-gated rollback, per-host deployment locks, and durable local run records are implemented. Draining, hooks, extensions, update/scan/inventory, and server mode are not yet implemented.
+> Status: the CLI MVP supports ordered SSH deployments, health-gated rollback, per-host deployment locks, durable local run records, and sbomnix-backed SBOM and vulnerability scans. Draining, hooks, scan policy, update/inventory, extensions, and server mode are not yet implemented.
 
 ## Documentation
 
@@ -30,12 +30,13 @@ Implemented:
 - Per-host remote deployment locks, with the current lock owner reported to a concurrent caller.
 - fsync'd local JSONL run records containing desired and observed closures, events, health outcomes, and final status.
 - A QEMU NixOS integration test covering a successful two-host rollout, idempotency, manual rollback health verification, automatic rollback, rollback-health failure, and lock contention.
+- `scan` generates CycloneDX and SPDX SBOMs and sbomnix vulnerability reports for both each host's desired and active system closures.
 
 Not implemented yet:
 
 - Traffic draining/enabling, group hooks, resumable runs, and distributed leases for a future controller.
-- `update`, `scan`, `inventory`, and `serve`; the CLI accepts these commands but returns an unimplemented error.
-- Extension execution, SBOM/CVE scanning, NetBox/MR integrations, metrics, and the Kubernetes/ArgoCD controller.
+- `update`, `inventory`, and `serve`; the CLI accepts these commands but returns an unimplemented error.
+- Vulnerability policy enforcement (severity thresholds and expiring exceptions), NetBox/MR integrations, metrics, and the Kubernetes/ArgoCD controller.
 - Revision-aware drift classification: Cattix currently reports only `in-sync`, `drifted`, or `unreachable` from the active closure.
 
 ## Principles
@@ -206,7 +207,7 @@ cattix deploy [--group g | --host h] [--dry-run] [--force] [--active-closure-tim
 cattix rollback --host h [--active-closure-timeout 45m]
                                       # activate and health-check the Cattix-saved previous generation
 cattix update ...                    # not implemented
-cattix scan ...                      # not implemented
+cattix scan [--group g | --host h] [--output-dir DIR] # SBOM and vulnerability scan
 cattix inventory ...                 # not implemented
 cattix serve                         # not implemented
 ```
@@ -301,16 +302,12 @@ pending → building → locking → copying → activating → checking → don
 - Each input is updated separately, so pins with different release cadences (e.g. stable nixpkgs vs master for one service) get separate MRs.
 - A check flags new NixOS releases so release upgrades are planned.
 
-### Vulnerability scanning (planned)
+### Vulnerability scanning
 
-- Create a CycloneDX SBOM from each host's system with `sbomnix`, then scan it with `grype` and `vulnix` (OSV and NVD data).
-- An ignore list in the repository (`cattix/vuln-ignore.yaml`) requires a reason and an expiry for every entry. Nixpkgs often patches a CVE without bumping the version, so without this list scanners report fixed CVEs and people stop reading the results.
-- Scan both the build from git and what's deployed on each host.
-- Outputs:
-  - JSON report and SBOM files
-  - Prometheus metrics (`cattix_vulnerabilities{host, severity}`)
-  - optional upload to Dependency-Track
-- Exits non-zero when a new critical or high CVE isn't on the ignore list.
+- `scan` scans the desired closure from its flake target, so sbomnix can enrich its SBOM with nixpkgs metadata. It scans the active closure by store path when it differs; matching closures reuse the desired scan.
+- Each scanned closure gets CycloneDX and SPDX SBOMs, an SBOM CSV, a SARIF vulnerability report, and JSON scanner evidence. A per-run JSON manifest records host, closure, and artifact paths.
+- Reports are written under `$XDG_STATE_HOME/cattix/scans` (or `~/.local/state/cattix/scans`); pass `--output-dir DIR` to select a parent directory.
+- Severity thresholds, expiring exceptions, and metrics/export integrations are planned. Active store paths do not identify their originating nixpkgs revision, so their SBOM metadata can be less complete than desired-closure metadata.
 
 ### Inventory (planned)
 
@@ -331,7 +328,6 @@ cattix-cli        clap frontend and terminal/JSON event rendering
 # planned crates
 cattix-extension-api versioned API for external checks, drains and hooks
 cattix-extensions-haproxy optional HAProxy drain and health-check extension
-cattix-scan       SBOM, scanners, ignore list, report model
 cattix-sinks      NetBox, GitLab/GitHub MRs, Prometheus, Dependency-Track
 cattix-controller kube-rs controller + /metrics (optional)
 ```
@@ -391,7 +387,7 @@ A controller mode uses custom resources, so ArgoCD's UI can display the fleet:
 | Automatic rollback | on SSH loss | no | no (boot entry first) | no | closure rollback on failed checks |
 | Drift detection | no | no | no | no | closure comparison |
 | Update MRs with diff | no | no | no | no | planned |
-| Vulnerability scanning | no | no | no | no | planned |
+| Vulnerability scanning | no | no | no | no | yes (SBOM and SARIF reports) |
 
 cattix does not do provisioning (use OpenTofu), secrets (use agenix or sops-nix) or disk setup (use disko or nixos-anywhere).
 
@@ -401,7 +397,7 @@ cattix does not do provisioning (use OpenTofu), secrets (use agenix or sops-nix)
 2. **Done — dogfooding deploy MVP:** sequential Nix/SSH rollout, health-gated rollback, post-rollback checks, remote per-host locks, durable local records, and configurable active-closure wait. Resume and controller-oriented distributed leases remain later work.
 3. **Drain and hooks:** generic drain interface, HAProxy extension, `haproxy-up` check, and group hooks.
 4. **Extensions:** versioned Rust extension API, explicit registration of external crates, capability checks, and extension audit events.
-5. **Scan:** sbomnix + grype/vulnix, ignore list, JSON, and metrics output.
+5. **Scan policy and integrations:** severity thresholds, expiring exception list, report aggregation, and metrics output.
 6. **Update:** per-input updates, closure diff report, and GitLab/GitHub MR creation.
 7. **Inventory:** NetBox sync.
 8. **Controller:** metrics, CRDs, kube-rs controller, and ArgoCD health checks.

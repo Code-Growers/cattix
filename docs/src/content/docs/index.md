@@ -17,7 +17,7 @@ The documentation is maintained as one page. A plain Markdown version for langua
 
 The CLI MVP is ready for dogfooding. Implemented commands are `groups`, `status`, `diff`, `plan`, `deploy`, and single-host `rollback`. The deployment path includes ordered SSH activation, command/HTTP/TCP/gRPC health checks, automatic rollback after failed post-deployment checks, remote per-host locks, and durable local run records.
 
-`update`, `scan`, `inventory`, and `serve` are listed in the CLI but currently return an unimplemented error. Traffic draining, group hooks, resumable runs, extensions, revision-aware drift classification, external inventory and vulnerability integrations, and the Kubernetes/ArgoCD controller are planned. The CLI currently classifies hosts as `in-sync`, `drifted`, or `unreachable` based on system closure paths.
+`update`, `inventory`, and `serve` are listed in the CLI but currently return an unimplemented error. `scan` uses pinned sbomnix tools to generate SBOMs and vulnerability reports for desired and active system closures. Traffic draining, group hooks, resumable runs, extensions, revision-aware drift classification, scan policy, external inventory integrations, and the Kubernetes/ArgoCD controller are planned. The CLI currently classifies hosts as `in-sync`, `drifted`, or `unreachable` based on system closure paths.
 
 ## How it works
 
@@ -192,7 +192,8 @@ cattix --flake . rollback --host gitlab-standby
 | `plan [--host HOST | --group GROUP]` | Show the selected rollout order and steps without deploying. |
 | `deploy [--host HOST | --group GROUP] [--dry-run] [--force]` | Build, copy, activate, and health-check selected hosts in order; a failed post-activation check triggers rollback and stops the rollout. `--dry-run` previews closure changes without modifying hosts. `--force` deploys even when active and expected closure paths match. With no scope, deploy the full fleet. |
 | `rollback --host HOST` | Activate and health-check the closure saved before the most recent Cattix activation on that host. |
-| `update`, `scan`, `inventory`, `serve` | Reserved CLI commands; not implemented yet. |
+| `scan` | Generates CycloneDX and SPDX SBOMs, an SBOM CSV, SARIF findings, and scanner evidence for the desired closure. Scans the active closure if it differs. |
+| `update`, `inventory`, `serve` | Reserved CLI commands; not implemented yet. |
 
 `--host` and `--group` are mutually exclusive. Deployment and rollback wait up to 20 minutes for the active closure by default. `--active-closure-timeout` accepts seconds, minutes, or hours, such as `45m`. Interactive deployments use a fixed terminal viewport: colored step updates stay above a one-third-height log pane, and the pane follows new build/copy/check lines by default. Use arrow keys, Page Up/Down, Home/End, or the mouse wheel to inspect earlier lines. Older lines move out of view without scrolling the terminal. The interactive screen is restored when the command exits. Colors respect terminal settings such as `NO_COLOR`. JSON output and piped event output retain the complete structured event stream.
 
@@ -250,7 +251,7 @@ Run `make help` for common project commands. Rust workflows include `make build`
 
 ## Roadmap and boundaries
 
-Planned work includes traffic draining and enabling, ordered group hooks, resumable deployments, distributed leases for a controller, revision-aware drift, update reports and merge requests, SBOM/CVE scanning, NetBox inventory sync, Prometheus metrics, and a Kubernetes controller with ArgoCD health integration. These are not current CLI capabilities.
+Planned work includes traffic draining and enabling, ordered group hooks, resumable deployments, distributed leases for a controller, revision-aware drift, vulnerability severity policy and expiring exceptions, update reports and merge requests, NetBox inventory sync, Prometheus metrics, and a Kubernetes controller with ArgoCD health integration.
 
 Cattix focuses on fleet inspection and rollout. Use separate tools for machine provisioning (for example OpenTofu), secrets (for example agenix or sops-nix), and disk setup (for example disko or nixos-anywhere).
 
